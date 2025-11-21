@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Conversations • Son of Wisdom</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main id="app" class="history-app">
+      <p class="powered-by">powered by Son of Wisdom</p>
+
+      <header class="history-header">
+        <button id="backBtn" class="ghost" aria-label="Back">← Home</button>
+        <h1 class="h-heading">Conversations</h1>
+        <button id="newBtn" class="cta small">+ New</button>
+      </header>
+
+      <section id="threads" class="thread-list" aria-live="polite">
+        <!-- rows injected -->
+      </section>
+
+      <footer class="history-footer">
+        <div id="meRow" class="me-row">
+          <div class="me-dot">B</div>
+          <div class="me-name">Blake Templeton</div>
+          <button id="settingsBtn" class="icon-gear" aria-label="Settings"></button>
+        </div>
+      </footer>
+    </main>
+
+    <script type="module" src="./app/history.js"></script>
+  </body>
+</html>

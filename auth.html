@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — Son of Wisdom</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="sow-shell">
+
+  <!-- Hero / brand -->
+  <header class="sow-hero" aria-label="Son of Wisdom">
+    <div class="sow-hero-logo-ring">
+      <div class="sow-hero-logo-inner">
+        <img src="/Sonofwisdom.png" alt="Son of Wisdom logo" class="sow-hero-logo-img" />
+      </div>
+    </div>
+
+    <h1 class="sow-hero-title">Son of Wisdom</h1>
+    <p class="sow-hero-tagline">An AI Coach for the Warrior Heart.</p>
+
+    <h2 class="sow-hero-welcome">Welcome, Son of Wisdom</h2>
+    <p class="sow-hero-subcopy">
+      Step into clarity, courage, and spiritual leadership.
+    </p>
+  </header>
+
+  <!-- Auth card -->
+  <main id="auth-app" class="auth-main" aria-live="polite">
+    <section class="auth-card auth-card--primary">
+      <h3 class="auth-card-title">Welcome back</h3>
+
+      <div class="auth-field">
+        <label for="email">Email</label>
+        <input
+          id="email"
+          class="input auth-input"
+          type="email"
+          placeholder="you@domain.com"
+          autocomplete="email"
+          required
+        />
+      </div>
+
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input
+          id="password"
+          class="input auth-input"
+          type="password"
+          placeholder="••••••••"
+          autocomplete="current-password"
+          required
+        />
+      </div>
+
+      <div class="row tiny auth-links-row">
+        <a id="link-signup" href="#" class="auth-link">Create an account</a>
+        <a id="link-forgot" href="#" class="auth-link">Forgot password?</a>
+      </div>
+
+      <button id="btn-signin" class="btn primary auth-submit" type="button">
+        Sign in
+      </button>
+
+      <div
+        id="status"
+        class="status-line tiny auth-status"
+        role="status"
+        aria-live="polite"
+        style="display:none;"
+      ></div>
+    </section>
+  </main>
+
+  <footer class="sow-footer tiny">
+    powered by <span class="brand-mini">Son of Wisdom</span>
+  </footer>
+
+  <script type="module" src="/app/auth.js"></script>
+</body>
+</html>

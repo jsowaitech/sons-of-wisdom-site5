@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Son of Wisdom — Conversations</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body class="sow-shell">
+  <header class="appbar">
+    <button id="btn-close" class="icon-btn" aria-label="Back to chat" title="Back">
+      <span style="display:inline-block;font-size:22px;line-height:1;">×</span>
+    </button>
+
+    <div class="powered tiny">powered by <span class="brand-mini">Son of Wisdom</span></div>
+
+    <button id="btn-new" class="btn pill small">+ New Conversation</button>
+  </header>
+
+  <main class="content" role="main">
+    <section class="hero-mini">
+      <h1 class="hero-mini-title">Son of Wisdom</h1>
+      <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+    </section>
+
+    <section aria-label="Conversations" style="max-width:980px;margin:0 auto;">
+      <h2 class="tiny muted" style="letter-spacing:.08em;margin:12px 0 10px;">CONVERSATIONS</h2>
+      <p class="muted tiny">History UI will go here. For now, use “New Conversation”.</p>
+    </section>
+  </main>
+
+  <script type="module">
+    const goHomeFresh = () => {
+      const url = new URL("home.html", window.location.origin);
+      url.searchParams.set("new", "1");
+      url.searchParams.set("ts", Date.now().toString());
+      window.location.replace(url.toString());
+    };
+
+    document.getElementById("btn-new")  ?.addEventListener("click", (e) => { e.preventDefault(); goHomeFresh(); });
+    document.getElementById("btn-close")?.addEventListener("click", (e) => { e.preventDefault(); goHomeFresh(); });
+  </script>
+</body>
+</html>

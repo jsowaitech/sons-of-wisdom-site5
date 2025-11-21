@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Son of Wisdom — Home</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body class="sow-shell chat-app">
+  <!-- Top app bar -->
+  <header class="appbar">
+    <button id="btn-menu" class="icon-btn hamburger" aria-label="Open conversations">
+      <span></span><span></span><span></span>
+    </button>
+
+    <div class="powered tiny">powered by <span class="brand-mini">Son of Wisdom</span></div>
+
+    <button id="btn-logout" class="btn small logout-btn">Logout</button>
+  </header>
+
+  <!-- Main content -->
+  <main class="content" role="main">
+    <section class="hero-mini">
+      <h1 class="hero-mini-title">Son of Wisdom</h1>
+      <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+    </section>
+
+    <section class="chips simple-chips" aria-label="Suggestions">
+      <button class="chip" data-fill="Boosting energy and vitality tips">Boosting energy and vitality tips</button>
+      <button class="chip" data-fill="I feel stuck about my business">I feel stuck about my business</button>
+      <button class="chip" data-fill="Help me prepare for a tough conversation">Help me prepare for a tough conversation</button>
+    </section>
+
+    <section id="chat-panel" class="chat-panel" aria-live="polite">
+      <div id="chat-box" class="chat-box"></div>
+    </section>
+
+    <div id="status" class="status-line tiny">Signed in. How can I help?</div>
+  </main>
+
+  <!-- Composer dock -->
+  <footer id="composer" class="composer" role="contentinfo">
+    <div class="dock">
+      <div class="dock-tools">
+        <button id="btn-call"  class="btn ghost pill">Call</button>
+        <button id="btn-files" class="btn ghost pill">Files</button>
+        <button id="btn-speak" class="btn ghost pill">Speak</button>
+      </div>
+
+      <div class="dock-row">
+        <input
+          id="q"
+          class="input dock-input"
+          type="text"
+          placeholder="Ask Son of Wisdom AI…"
+          autocomplete="off" />
+        <button id="btn-send" class="btn primary dock-send">Send</button>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app/dev-local.js"></script>
+  <script type="module" src="app/home.js"></script>
+</body>
+</html>

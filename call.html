@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Son of Wisdom — Call</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="sow-shell page-call">
+
+  <header class="appbar appbar-plain">
+    <div class="powered tiny">
+      powered by <span class="brand-mini">Son of Wisdom</span>
+    </div>
+    <a href="home.html" class="btn small ghost">Back to chat</a>
+  </header>
+
+  <main class="call-main" role="main">
+    <section class="hero-mini">
+      <h1 class="hero-mini-title">Son of Wisdom</h1>
+      <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+    </section>
+
+    <section class="call-card">
+      <div id="avatar-container" class="call-avatar-wrap">
+        <canvas id="voiceRing"></canvas>
+        <img src="Sonofwisdom.png" alt="Son of Wisdom" class="call-avatar-img" />
+      </div>
+
+      <p id="status-text" class="call-status">
+        Tap the blue call button to begin.
+      </p>
+      <div id="call-timer" class="call-timer">00:00</div>
+
+      <section id="transcript" class="call-transcript">
+        <div id="transcript-list" class="transcript-list"></div>
+        <div id="transcript-interim" class="transcript-interim"></div>
+      </section>
+
+      <div class="call-controls">
+        <button id="mic-btn" class="btn circle ghost" aria-pressed="false" title="Mute/unmute mic">
+          🎙
+        </button>
+
+        <button id="call-btn" class="btn circle primary call-toggle" title="Start / end call">
+          📞
+        </button>
+
+        <button id="speaker-btn" class="btn circle ghost" aria-pressed="true" title="Mute/unmute speaker">
+          🔊
+        </button>
+
+        <button id="mode-btn" class="btn circle ghost" aria-pressed="false" title="Switch to chat view">
+          …
+        </button>
+      </div>
+    </section>
+
+    <!-- Chat panel is injected after #transcript by call.js -->
+  </main>
+
+  <script type="module" src="app/call.js"></script>
+</body>
+</html>
