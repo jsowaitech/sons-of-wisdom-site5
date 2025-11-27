@@ -9,6 +9,7 @@
     "dotenv": "^16.4.1",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "openai": "^6.9.1"
+    "openai": "^6.9.1",
+    "@pinecone-database/pinecone": "^6.1.0"
   }
 }
