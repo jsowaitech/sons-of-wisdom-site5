@@ -1,0 +1,65 @@
+<!-- finish-signup.html -->
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Set your password • Son of Wisdom</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body class="auth-page">
+    <main class="auth-shell">
+      <header class="auth-header">
+        <img
+          src="assets/logo-sow.svg"
+          alt="Son of Wisdom logo"
+          class="auth-logo"
+          onerror="this.style.display='none'"
+        />
+        <h1>Set your password</h1>
+        <p class="auth-subtitle">
+          You’ve confirmed your email. Choose a password to finish creating or
+          restoring your account.
+        </p>
+      </header>
+
+      <p id="pw-status" class="auth-status"></p>
+
+      <form id="set-password-form" class="auth-form hidden">
+        <label class="auth-field">
+          <span>New password</span>
+          <input
+            id="new-password"
+            type="password"
+            minlength="8"
+            autocomplete="new-password"
+            required
+          />
+        </label>
+
+        <label class="auth-field">
+          <span>Confirm password</span>
+          <input
+            id="confirm-password"
+            type="password"
+            minlength="8"
+            autocomplete="new-password"
+            required
+          />
+        </label>
+
+        <button type="submit" class="auth-btn primary">
+          Save password
+        </button>
+      </form>
+
+      <p class="auth-footer">
+        Already have a password?
+        <a href="auth.html">Back to sign in</a>
+      </p>
+    </main>
+
+    <script type="module" src="./supabase.js"></script>
+    <script type="module" src="./finish-signup.js"></script>
+  </body>
+</html>
