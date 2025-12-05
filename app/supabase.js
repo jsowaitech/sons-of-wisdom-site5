@@ -1,12 +1,13 @@
 // app/supabase.js
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+// Prefer window overrides (optional)
 const SUPABASE_URL =
   window.SUPABASE_URL || "https://utqtqqvaboeibnyjgbtk.supabase.co";
 
 const SUPABASE_ANON_KEY =
   window.SUPABASE_ANON_KEY ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0cXRxcXZhYm9laWJueWpnYnRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUwNzg4ODUsImV4cCI6MjA3MDY1NDg4NX0.GShilY2N0FHlIl5uohZzH5UjSItDGpbQjVDltQi5kbQ";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYm9laWJueWpnYnRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUwNzg4ODUsImV4cCI6MjA3MDY1NDg4NX0.GShilY2N0FHlIl5uohZzH5UjSItDGpbQjVDltQi5kbQ";
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
