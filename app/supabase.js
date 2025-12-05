@@ -1,35 +1,36 @@
-// app/supabase.js
-// Tiny, loop-safe auth helpers.
+// supabase.js
+// Shared Supabase client for Son of Wisdom (browser-safe)
 
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
+// IMPORTANT:
+// 1) Use the *anon* public key here, NOT the service role key.
+// 2) Keep this file in the same folder as auth.html, home.html, etc.
 
-// --------------- ENV -----------------
-const SUPABASE_URL  = window.SUPABASE_URL  || "https://plrobtlpedniyvkpwdmp.supabase.co";
-const SUPABASE_ANON = window.SUPABASE_ANON || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBscm9idGxwZWRuaXl2a3B3ZG1wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY2Mjk4NTAsImV4cCI6MjA2MjIwNTg1MH0.7jK32FivCUTXnzG7sOQ9oYUyoJa4OEjMIuNN4eRr-UA";
-// -------------------------------------
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON);
+// ---- Your project settings ----
+const SUPABASE_URL = "https://plrobtlpedniyvkpwdmp.supabase.co";
 
-export async function getSession() {
-  const { data } = await supabase.auth.getSession();
-  return data?.session ?? null;
+// Put your **anon** public key below (NOT the service_role key)
+const SUPABASE_ANON_KEY =
+  window.SUPABASE_ANON_KEY ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBscm9idGxwZWRuaXl2a3B3ZG1wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY2Mjk4NTAsImV4cCI6MjA2MjIwNTg1MH0.7jK32FivCUTXnzG7sOQ9oYUyoJa4OEjMIuNN4eRr-UA";
+
+// Basic guard so auth.js doesn’t blow up silently
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error(
+    "[supabase] Missing SUPABASE_URL or SUPABASE_ANON_KEY. " +
+      "Check supabase.js configuration."
+  );
 }
 
-/**
- * Use on protected pages (e.g., home.html).
- * If unauthenticated, redirect to auth.html with a return URL.
- * Never redirect when you're already on auth.html (prevents loops).
- */
-export async function ensureAuthedOrRedirect() {
-  const session = await getSession();
-  if (session) return session;
+// Create the client
+export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+  },
+});
 
-  const here = new URL(window.location.href);
-  if (here.pathname.endsWith("/auth.html")) return null; // don't bounce on auth page
-
-  const dest = `/auth.html?redirect=${encodeURIComponent(
-    here.pathname + here.search
-  )}`;
-  window.location.replace(dest);
-  return null;
-}
+// For quick debugging in the console
+window.__supabase = supabase;
+console.log("[supabase] client initialised");
