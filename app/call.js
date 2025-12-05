@@ -229,6 +229,54 @@ function sendAssistantTextToTranscript(text) {
   });
 }
 
+/* 🔵 NEW: live-ish streaming of assistant text while audio plays */
+let aiTextStream = null;
+
+function streamAssistantTextLive(text) {
+  const clean = (text || "").trim();
+  if (!clean) return { stop() {} };
+
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (!words.length) return { stop() {} };
+
+  // approximate speech rate ~160 wpm
+  const wps = 2.7;
+  const totalSec = Math.max(2, words.length / wps);
+  const intervalMs = Math.max(
+    45,
+    Math.floor((totalSec * 1000) / Math.max(words.length, 1))
+  );
+
+  let idx = 0;
+  let stopped = false;
+  let lastSent = "";
+
+  const timer = setInterval(() => {
+    if (stopped) return;
+    idx = Math.min(idx + 1, words.length);
+    const partial = words.slice(0, idx).join(" ");
+    if (partial !== lastSent) {
+      lastSent = partial;
+      postToTranscriptPanel({
+        type: "interim",
+        text: partial,
+        speaker: "assistant",
+      });
+    }
+    if (idx >= words.length) {
+      clearInterval(timer);
+      sendAssistantTextToTranscript(clean);
+    }
+  }, intervalMs);
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 /* Derive a short conversation title from first user utterance */
 function deriveTitleFromText(raw) {
   let t = (raw || "").replace(/\s+/g, " ").trim();
@@ -950,6 +998,7 @@ function endCall() {
   stopMicVAD();
   stopRing();
   stopBargeInMonitor();
+  aiTextStream?.stop?.(); // 🔵 stop live AI transcript if running
 
   try {
     globalStream?.getTracks().forEach((t) => t.stop());
@@ -1343,6 +1392,8 @@ async function playAIWithBargeIn(
         } catch (e) {
           // ignore
         }
+        // stop live AI transcript stream on barge-in
+        aiTextStream?.stop?.();
         statusText.textContent = "Go ahead…";
         cleanup();
       });
@@ -1460,6 +1511,8 @@ async function uploadRecordingAndNotify() {
   let revokeLater = null;
   let aiBlob = null;
   let aiTextFromJSON = "";
+  let assistantText = ""; // 🔵 NEW: explicit text from backend
+
   try {
     const body = {
       user_id,
@@ -1503,8 +1556,11 @@ async function uploadRecordingAndNotify() {
       revokeLater = aiPlayableUrl;
     } else if (ct.includes("application/json")) {
       const data = await resp.json();
+      // 🔵 Prefer assistant_text field when present (Option A)
+      assistantText = (data?.assistant_text || "").trim();
       aiTextFromJSON =
-        data?.text ?? data?.transcript ?? data?.message ?? "";
+        assistantText ||
+        (data?.text ?? data?.transcript ?? data?.message ?? "");
       const b64 = data?.audio_base64;
       const url =
         data?.result_audio_url ||
@@ -1548,6 +1604,17 @@ async function uploadRecordingAndNotify() {
     if (aiTextFromJSON) await typewriter(aiBubble, aiTextFromJSON, 18);
   }
 
+  // 🔵 Start "live" assistant transcript stream (Option A) when we have text and no N8N ASR
+  const textToStream =
+    (assistantText || aiTextFromJSON || "").trim() || "";
+  const shouldStreamAssistant =
+    !!textToStream && !N8N_TRANSCRIBE_URL; // don't double-stream if webhook is on
+
+  if (shouldStreamAssistant) {
+    aiTextStream?.stop?.();
+    aiTextStream = streamAssistantTextLive(textToStream);
+  }
+
   const { interrupted } = await playAIWithBargeIn(aiPlayableUrl, {
     aiBlob: !aiTextFromJSON ? aiBlob : null,
     aiBubbleEl: aiBubble,
@@ -1560,9 +1627,8 @@ async function uploadRecordingAndNotify() {
     }
   }
 
-  // If we had AI text in JSON *and* we're not using N8N streaming,
-  // mirror it into the live transcript panel.
-  if (aiTextFromJSON && !N8N_TRANSCRIBE_URL) {
+  // If we did NOT simulate live streaming (or if webhook is on), still send a final line
+  if (!shouldStreamAssistant && aiTextFromJSON && !N8N_TRANSCRIBE_URL) {
     sendAssistantTextToTranscript(aiTextFromJSON);
   }
 
