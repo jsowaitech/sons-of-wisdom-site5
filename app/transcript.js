@@ -7,12 +7,15 @@
 // PATCHED:
 // ✅ Embed "ready" handshake -> parent can queue messages (prevents missing greeting)
 // ✅ Embed-mode message accept is limited to parent window only (safer than "*")
-// ✅ Auto-scroll is more robust and turns off when the user scrolls up
+// ✅ NEW: Optional conversationId (?c=) → pre-load conversation_messages history
+// ✅ NEW: Slightly stronger auto-scroll using scrollTo with smooth behaviour
 
 import { supabase } from "./supabase.js";
 
 const params = new URLSearchParams(window.location.search);
 const isEmbed = params.get("embed") === "1";
+const conversationId =
+  params.get("c") || params.get("conversationId") || null;
 
 const els = {
   list: document.getElementById("turnList"),
@@ -44,11 +47,16 @@ function fmtTime(input) {
 
 function scrollToBottom() {
   if (!els.list || !autoScrollEnabled) return;
-  const el = els.list;
-  // Use rAF so layout has settled before we force scroll
-  window.requestAnimationFrame(() => {
-    el.scrollTop = el.scrollHeight;
-  });
+  try {
+    // Use scrollTo for slightly more reliable behaviour in some browsers
+    els.list.scrollTo({
+      top: els.list.scrollHeight,
+      behavior: "smooth",
+    });
+  } catch {
+    // Fallback
+    els.list.scrollTop = els.list.scrollHeight;
+  }
 }
 
 function setLive(isLive) {
@@ -214,9 +222,45 @@ function setLiveInterim(text, role = "user") {
 
 /* ---------- Data: initial load + realtime ---------- */
 
+/**
+ * NEW: optional conversation history loader.
+ * If transcript.html is opened with ?c=<conversationId>,
+ * we show the existing text-chat history for that thread as the
+ * top part of the Live Transcription feed.
+ */
+async function loadConversationHistory(convId) {
+  if (!convId) return;
+  try {
+    const { data, error } = await supabase
+      .from("conversation_messages")
+      .select("role, content, created_at")
+      .eq("conversation_id", convId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.warn("[transcript] error loading conversation_messages:", error);
+      return;
+    }
+
+    (data || []).forEach((row) => {
+      const role = row.role === "assistant" ? "assistant" : "user";
+      appendTurn(role, row.content || "", row.created_at, { animate: false });
+    });
+  } catch (e) {
+    console.warn("[transcript] loadConversationHistory failed:", e);
+  }
+}
+
 async function loadInitial(callId) {
   clearUI();
   setLive(false);
+
+  // 1) Prepend conversation-level history if we have a conversationId
+  if (conversationId) {
+    await loadConversationHistory(conversationId);
+  }
+
+  // 2) Then load any stored call_sessions for this specific call
   if (!callId) return;
 
   // IMPORTANT: order by created_at (your table has it; timestamp may not)
@@ -229,10 +273,7 @@ async function loadInitial(callId) {
 
   // If schema drifted and call_id column is named differently, attempt fallback.
   if (error) {
-    console.warn(
-      "[transcript] error loading call_sessions (call_id):",
-      error
-    );
+    console.warn("[transcript] error loading call_sessions (call_id):", error);
 
     const alt = await supabase
       .from("call_sessions")
@@ -372,24 +413,6 @@ els.closeBtn?.addEventListener("click", (e) => {
   else window.parent?.postMessage?.({ type: "sow-close-transcript" }, "*");
 });
 
-// 🔵 When user scrolls manually, toggle auto-scroll based on proximity to bottom
-if (els.list) {
-  els.list.addEventListener("scroll", () => {
-    const el = els.list;
-    const distanceFromBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight;
-    const nearBottom = distanceFromBottom < 48;
-
-    if (nearBottom && !autoScrollEnabled) {
-      autoScrollEnabled = true;
-      updateAutoScrollUI();
-    } else if (!nearBottom && autoScrollEnabled) {
-      autoScrollEnabled = false;
-      updateAutoScrollUI();
-    }
-  });
-}
-
 /* ---------- Embed mode: accept live postMessage from call.js ---------- */
 
 window.addEventListener("message", (event) => {
@@ -409,6 +432,8 @@ window.addEventListener("message", (event) => {
   switch (type) {
     case "clear":
       clearUI();
+      // Repaint conversation history on clear, if we have it
+      if (conversationId) loadConversationHistory(conversationId);
       break;
     case "interim":
       setLiveInterim(text, speaker);
@@ -425,30 +450,39 @@ window.addEventListener("message", (event) => {
 
 /* ---------- Boot ---------- */
 
-if (isEmbed) {
-  document.body.classList.add("embed");
-  if (els.footer) els.footer.style.display = "none";
-}
-
-updateAutoScrollUI();
-
-const startId = chooseStartCallId();
-if (startId) watchCallId(startId);
-else {
-  clearUI();
-  setLive(false);
-}
-
-// ✅ Embed ready handshake so parent can flush queued transcript events (prevents missing greeting)
-if (isEmbed) {
-  try {
-    window.parent?.postMessage?.(
-      { source: "sow-transcript", type: "ready" },
-      "*"
-    );
-  } catch {
-    // ignore
+async function boot() {
+  if (isEmbed) {
+    document.body.classList.add("embed");
+    if (els.footer) els.footer.style.display = "none";
   }
+
+  updateAutoScrollUI();
+
+  // Preload conversation history even if there is no current call_id
+  if (conversationId) {
+    await loadConversationHistory(conversationId);
+  }
+
+  const startId = chooseStartCallId();
+  if (startId) await watchCallId(startId);
+  else {
+    // keep whatever history we rendered and just mark offline
+    setLive(false);
+  }
+
+  // ✅ Embed ready handshake so parent can flush queued transcript events (prevents missing greeting)
+  if (isEmbed) {
+    try {
+      window.parent?.postMessage?.(
+        { source: "sow-transcript", type: "ready" },
+        "*"
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  console.log("[SOW] transcript.js ready");
 }
 
-console.log("[SOW] transcript.js ready");
+boot();

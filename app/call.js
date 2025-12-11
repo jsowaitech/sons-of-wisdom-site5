@@ -1,6 +1,6 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// UPDATED: adds idle-detection + system_event calls to call-coach
+// UPDATED: idle-detection + system_event calls + transcript iframe handshake
 // - If user doesn't respond after AI finishes:
 //   1) Blake sends a nudge (system_event: no_response_nudge)
 //   2) Then Blake sends an ending line (system_event: no_response_end) and call ends
@@ -169,27 +169,12 @@ let greetingAudioUrl = null;
 /* ---------- NEW: Idle detection (no response) ---------- */
 const NO_RESPONSE = {
   // after AI finishes speaking, wait this long for user to speak
-  FIRST_NUDGE_MS: 12_000,
+  FIRST_NUDGE_MS: 20_000,
   // after the nudge is spoken, wait this long for user to speak
-  END_CALL_MS: 12_000,
+  END_CALL_MS: 20_000,
   // minimum time after AI speech before any idle logic can run
   ARM_DELAY_MS: 600,
 };
-
-const IDLE_FALLBACK = {
-  nudge: [
-    "It seems you’ve gone quiet for a moment. If you’re still here, I’m listening.",
-    "I haven’t heard you yet. Take your time—when you’re ready, you can tell me what’s going on.",
-  ],
-  end: [
-    "Since it’s been quiet for a while, I’ll go ahead and end our call for now. You’re always welcome to come back.",
-    "I haven’t heard anything more, so I’ll wrap our call here. I’m here whenever you’re ready to talk again.",
-  ],
-};
-
-function pickRandom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
 
 let idleArmed = false;
 let idleStep = 0; // 0=none, 1=nudged
@@ -243,9 +228,46 @@ function startCallTimer() {
   callTimerInterval = setInterval(updateCallTimer, 1000);
 }
 
+/* 🔵 Transcript iframe bridge with handshake + queue */
+let transcriptPanelReady = false;
+const transcriptEventQueue = [];
+
+function flushTranscriptEventQueue() {
+  if (!transcriptFrame || !transcriptFrame.contentWindow) return;
+  while (transcriptEventQueue.length) {
+    const payload = transcriptEventQueue.shift();
+    try {
+      transcriptFrame.contentWindow.postMessage(
+        { source: "sow-call", ...payload },
+        "*"
+      );
+    } catch (e) {
+      warn("postToTranscriptPanel flush error", e);
+      break;
+    }
+  }
+}
+
+// Listen for "ready" handshake from transcript.html?embed=1
+window.addEventListener("message", (event) => {
+  const data = event.data || {};
+  if (data.source === "sow-transcript" && data.type === "ready") {
+    transcriptPanelReady = true;
+    flushTranscriptEventQueue();
+  }
+});
+
 /* 🔵 Bridge helper: send events to the live transcript iframe */
 function postToTranscriptPanel(payload) {
-  if (!transcriptFrame || !transcriptFrame.contentWindow) return;
+  // If iframe not ready yet, queue the event
+  if (
+    !transcriptFrame ||
+    !transcriptFrame.contentWindow ||
+    !transcriptPanelReady
+  ) {
+    transcriptEventQueue.push(payload);
+    return;
+  }
   try {
     transcriptFrame.contentWindow.postMessage(
       { source: "sow-call", ...payload },
@@ -356,7 +378,8 @@ function disarmIdle(reason = "") {
 
 function shouldConsiderIdle() {
   if (!isCalling) return false;
-  if (isRecording) return false;
+  // NOTE: we intentionally allow idle checks while recording, because
+  // "idle" means we're listening but the user isn't speaking.
   if (isPlayingAI) return false;
   if (!idleArmed) return false;
   // don't fire immediately; give UI a moment
@@ -409,9 +432,7 @@ async function callCoachSystemEvent(eventType) {
   const b64 = data.audio_base64 || "";
   const mime = data.mime || "audio/mpeg";
 
-  if (!text && !b64) {
-    throw new Error("system_event missing text/audio");
-  }
+  if (!b64) throw new Error("system_event missing audio_base64");
   return { text, b64, mime };
 }
 
@@ -422,20 +443,11 @@ function base64ToBlobUrl(b64, mime = "audio/mpeg") {
   return URL.createObjectURL(blob);
 }
 
-async function playJsonTTS(
-  { text, b64, mime },
-  { ringColor = "#d4a373" } = {}
-) {
-  // Always mirror assistant text to the transcript immediately
-  if (text) {
-    sendAssistantTextToTranscript(text);
-  }
-
-  // If there's no audio, we’re done (text-only idle line)
-  if (!b64) return;
-
+async function playJsonTTS({ text, b64, mime }, { ringColor = "#d4a373" } = {}) {
   const url = base64ToBlobUrl(b64, mime);
   try {
+    // mirror text immediately
+    if (text) sendAssistantTextToTranscript(text);
     await safePlayOnce(url, { limitMs: 60_000, color: ringColor });
   } finally {
     try {
@@ -463,9 +475,6 @@ async function maybeRunNoResponseNudge() {
     await playJsonTTS(payload, { ringColor: "#d4a373" });
   } catch (e) {
     warn("no_response_nudge failed", e);
-    // Local fallback so user still sees a nudge if system_event fails
-    const text = pickRandom(IDLE_FALLBACK.nudge);
-    sendAssistantTextToTranscript(text);
   } finally {
     isPlayingAI = false;
     idleInFlight = false;
@@ -502,8 +511,6 @@ async function maybeRunNoResponseEnd() {
     await playJsonTTS(payload, { ringColor: "#d4a373" });
   } catch (e) {
     warn("no_response_end failed", e);
-    const text = pickRandom(IDLE_FALLBACK.end);
-    sendAssistantTextToTranscript(text);
   } finally {
     isPlayingAI = false;
     idleInFlight = false;
@@ -675,7 +682,7 @@ function ensureChatUI() {
       if (!txt) return;
       chatInput.value = "";
       appendMsg("me", txt);
-      noteUserActivity(); // NEW: counts as response activity
+      noteUserActivity(); // counts as response activity
       await sendChatToN8N(txt);
     });
     chatForm._wired = true;
@@ -742,7 +749,7 @@ const transcriptUI = {
       text,
       speaker: "user",
     });
-    noteUserActivity(); // NEW: interim counts as activity
+    noteUserActivity(); // interim counts as activity
   },
   addFinalLine(t) {
     const s = (t || "").trim();
@@ -758,7 +765,7 @@ const transcriptUI = {
       text: s,
       speaker: "user",
     });
-    noteUserActivity(); // NEW: final counts as activity
+    noteUserActivity(); // final counts as activity
   },
 };
 
@@ -1197,13 +1204,13 @@ async function startCall() {
       return;
     }
 
-    // ✅ Transcribe greeting BEFORE playback (Option A style)
+    // Transcribe greeting BEFORE playback
     statusText.textContent = "AI greeting you…";
     if (greetingPayload?.text) {
       sendAssistantTextToTranscript(greetingPayload.text);
     }
 
-    // Play greeting audio from Blob URL (always generated from JSON base64)
+    // Play greeting audio from Blob URL
     if (greetingAudioUrl) {
       await safePlayOnce(greetingAudioUrl, { limitMs: 60000 });
       try {
@@ -1251,8 +1258,7 @@ function endCall() {
   }
   globalStream = null;
   try {
-    if (mediaRecorder && mediaRecorder.state !== "inactive")
-      mediaRecorder.stop();
+    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
   } catch (e) {
     // ignore
   }
@@ -1376,7 +1382,7 @@ function openNativeRecognizer() {
     }
     transcriptUI.setInterim(interim);
     interimBuffer = interim;
-    if (interim) noteUserActivity(); // NEW
+    if (interim) noteUserActivity(); // user speaking
   };
 
   r.onerror = (e) => {
@@ -1424,15 +1430,12 @@ function closeNativeRecognizer() {
 async function captureOneTurn() {
   if (!isCalling || isRecording || isPlayingAI) return false;
 
-  // Do NOT disarm idle just because we started listening.
-  // We only want to reset idle when the user actually speaks.
-  // disarmIdle("captureOneTurn");
+  // We intentionally do NOT disarm idle here; this is the period
+  // where we want to detect "no response" if the user stays silent.
 
   finalSegments = [];
   interimBuffer = "";
   transcriptUI.setInterim("Listening…");
-  // Do NOT mark this as user activity; they haven’t spoken yet.
-  // noteUserActivity();
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -1651,7 +1654,7 @@ async function playAIWithBargeIn(
       stopBargeInMonitor();
       isPlayingAI = false;
 
-      // NEW: mark AI finished and arm idle timers for no-response flow
+      // mark AI finished and arm idle timers for no-response flow
       lastAIFinishedAt = Date.now();
       if (isCalling) armIdleAfterAI();
 
@@ -1696,13 +1699,10 @@ async function uploadRecordingAndNotify() {
   const combinedTranscript = finalText || interimText || "";
 
   if (combinedTranscript) {
-    noteUserActivity(); // NEW: user spoke
+    noteUserActivity(); // user actually spoke
     recentUserTurns.push(combinedTranscript);
     if (recentUserTurns.length > RECENT_USER_KEEP) {
-      recentUserTurns.splice(
-        0,
-        recentUserTurns.length - RECENT_USER_KEEP
-      );
+      recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
     }
     // Title the conversation on first meaningful utterance if still untitled
     maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(
@@ -1838,9 +1838,7 @@ async function uploadRecordingAndNotify() {
         lastAIFinishedAt = Date.now();
         if (isCalling) armIdleAfterAI();
 
-        upsertRollingSummary(user_id, device, rollingSummary).catch(
-          () => {}
-        );
+        upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
         return true;
       }
     }
@@ -1852,7 +1850,7 @@ async function uploadRecordingAndNotify() {
     } else if (ct.includes("application/json")) {
       const data = await resp.json();
 
-      // ✅ Option A: use assistant_text if provided
+      // use assistant_text if provided
       aiTextFromJSON = (
         data?.assistant_text ??
         data?.text ??
@@ -1900,7 +1898,7 @@ async function uploadRecordingAndNotify() {
     return false;
   }
 
-  // ✅ Mirror assistant text into transcript panel immediately (Option A)
+  // Mirror assistant text into transcript panel immediately
   if (aiTextFromJSON) {
     sendAssistantTextToTranscript(aiTextFromJSON);
   }
@@ -2007,10 +2005,7 @@ async function sendChatToN8N(userText) {
 
   recentUserTurns.push(userText);
   if (recentUserTurns.length > RECENT_USER_KEEP) {
-    recentUserTurns.splice(
-      0,
-      recentUserTurns.length - RECENT_USER_KEEP
-    );
+    recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
   }
 
   // Also allow chat text from call page to title an untitled conversation
@@ -2206,7 +2201,7 @@ async function playStreamedWebmOpus(response) {
     await new Promise((r) => (a.onended = r));
     URL.revokeObjectURL(url);
 
-    // NEW: streamed AI done, arm idle
+    // streamed AI done, arm idle
     lastAIFinishedAt = Date.now();
     if (isCalling) armIdleAfterAI();
 

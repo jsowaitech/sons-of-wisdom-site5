@@ -28,7 +28,7 @@ async function openaiChat(messages, opts = {}) {
   const body = {
     model: OPENAI_MODEL,
     messages,
-    temperature: opts.temperature ?? 0.8,
+    temperature: opts.temperature ?? 0.9,
   };
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
 
@@ -100,24 +100,48 @@ exports.handler = async (event) => {
     const deviceId = (body.device_id || "").toString().trim();
     const callId = (body.call_id || body.callId || "").toString().trim();
 
-    // Keep greeting short & TTS friendly
-    const system = `You are AI Blake, a concise masculine Christian coach for Son of Wisdom.
-Return a single short greeting (1–2 sentences) inviting the user to speak.
-No markdown, no bullet points, plain text only.`;
+    // 🚀 More varied, in-character, TTS-safe greeting
+    const system = `
+You are AI Blake, the masculine Christian mentor for Son of Wisdom, speaking in a calm, fatherly, confident tone.
 
-    const user = `Generate a fresh greeting for call mode.
+Task:
+Generate ONE short spoken greeting to start a live voice call.
+
+Hard rules:
+- 1 short sentence, at most 18 words.
+- No lists, no markdown, no bullets, no headings.
+- Plain conversational text only, TTS friendly.
+- Do NOT say "Hello, I'm here to listen and guide you".
+- Do NOT say "I'm AI Blake" or explain who you are.
+- Avoid repeating the same structure each time (do not always start with "Hello" or "Hi").
+- Sound like a seasoned mentor inviting a man to open up.
+
+Style:
+- Masculine, warm, direct.
+- You can say things like "Alright, let’s slow this down" or "Take a breath, you made it here".
+- Invite him to share what is heavy, tense, or on his heart right now.
+
+Output:
+Reply with ONLY the greeting sentence, nothing before or after it.
+    `.trim();
+
+    const user = `
+Generate a fresh greeting for call mode for this user and device.
 User: ${userId || "unknown"}
-Device: ${deviceId || "unknown"}`;
+Device: ${deviceId || "unknown"}
+
+Internally, come up with a few different possible greetings and choose one that is not generic or bland.
+Remember: output only that one chosen greeting sentence.
+    `.trim();
 
     const text = await openaiChat(
       [
         { role: "system", content: system },
         { role: "user", content: user },
       ],
-      { temperature: 0.9, maxTokens: 90 }
+      { temperature: 0.95, maxTokens: 60 }
     );
 
-    // ✅ REQUIRED: always return AI audio as base64 for transcribable greeting playback
     const audio = await elevenLabsTTS(text);
 
     return {
@@ -125,7 +149,7 @@ Device: ${deviceId || "unknown"}`;
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
-        assistant_text: text, // ✅ Option A: always present
+        assistant_text: text,
         audio_base64: audio.audio_base64,
         mime: audio.mime || "audio/mpeg",
         call_id: callId || null,
@@ -140,7 +164,7 @@ Device: ${deviceId || "unknown"}`;
         error: "Server error",
         detail: String(err),
         hint:
-          "Greeting has no static fallback now. Ensure ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are set in Netlify env.",
+          "Greeting has no static fallback now. Ensure OPENAI_API_KEY, ELEVENLABS_API_KEY, and ELEVENLABS_VOICE_ID are set in Netlify env.",
       }),
     };
   }
