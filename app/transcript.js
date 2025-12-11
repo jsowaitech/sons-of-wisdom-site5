@@ -1,12 +1,12 @@
 // app/transcript.js
 // Live transcription viewer for Son of Wisdom calls.
-// - Reads call_sessions from Supabase for a given call_id
+// - Loads call transcript from call_sessions by call_id
 // - Renders separate bubbles for user + AI
-// - Streams new inserts via Realtime (standalone mode)
-// - When embedded (?embed=1), hides call-id footer controls
-//   and tweaks layout so it fits inside the call page panel.
-// - NEW: when embedded, also accepts live postMessage events
-//   from call.js for real-time user + AI captions.
+// - Standalone mode: Supabase Realtime INSERT subscription
+// - Embed mode (?embed=1): parent (call.js) streams live text via postMessage (no realtime needed)
+// PATCHED:
+// ✅ Embed "ready" handshake -> parent can queue messages (prevents missing greeting)
+// ✅ Embed-mode message accept is limited to parent window only (safer than "*")
 
 import { supabase } from "./supabase.js";
 
@@ -30,11 +30,9 @@ let autoScrollEnabled = true;
 let currentCallId = "";
 let realtimeChannel = null;
 const cache = []; // { role, text, ts }
-
-/** Interim live bubble coming from call.js postMessage */
 let liveInterimEl = null;
 
-// ---------- Helpers ----------
+/* ---------- Helpers ---------- */
 
 function fmtTime(input) {
   if (!input) return "";
@@ -57,7 +55,6 @@ function setLive(isLive) {
 function clearUI() {
   if (els.list) els.list.innerHTML = "";
   cache.length = 0;
-  // also clear any interim bubble
   if (liveInterimEl && liveInterimEl.parentNode) {
     liveInterimEl.parentNode.removeChild(liveInterimEl);
   }
@@ -72,7 +69,6 @@ function updateAutoScrollUI() {
     : "Scroll locked";
 }
 
-// Type-out effect for new text
 function typeIntoElement(el, fullText) {
   const text = (fullText || "").toString();
   if (!el) return;
@@ -82,7 +78,6 @@ function typeIntoElement(el, fullText) {
     return;
   }
 
-  // Speed heuristic: shorter text → slightly slower; longer text → faster
   const minDelay = 8;
   const maxDelay = 24;
   const delay = Math.max(minDelay, Math.min(maxDelay, 1200 / text.length));
@@ -147,23 +142,20 @@ function appendTurn(role, text, ts, { animate = false } = {}) {
 
 function handleRow(row, { animate = false } = {}) {
   if (!row) return;
-  const ts = row.timestamp || row.created_at || new Date().toISOString();
 
-  if (row.input_transcript) {
-    appendTurn("user", row.input_transcript, ts, { animate });
-  }
-  if (row.ai_text) {
-    appendTurn("assistant", row.ai_text, ts, { animate });
-  }
+  // Prefer created_at; timestamp might not exist in your schema
+  const ts = row.created_at || row.timestamp || new Date().toISOString();
+
+  if (row.input_transcript) appendTurn("user", row.input_transcript, ts, { animate });
+  if (row.ai_text) appendTurn("assistant", row.ai_text, ts, { animate });
 }
 
-/** NEW: show interim text from live call.js events */
+/* Embed-only interim bubble */
 function setLiveInterim(text, role = "user") {
   const trimmed = (text || "").trim();
   if (!els.list) return;
 
   if (!trimmed) {
-    // clear interim
     if (liveInterimEl && liveInterimEl.parentNode) {
       liveInterimEl.parentNode.removeChild(liveInterimEl);
     }
@@ -203,6 +195,10 @@ function setLiveInterim(text, role = "user") {
 
     liveInterimEl = article;
   } else {
+    // If speaker changes mid-interim, swap class + label
+    liveInterimEl.className = `turn ${role} interim`;
+    const roleEl = liveInterimEl.querySelector(".role");
+    if (roleEl) roleEl.textContent = role === "assistant" ? "Blake" : "You";
     const textEl = liveInterimEl.querySelector(".text");
     if (textEl) textEl.textContent = trimmed;
   }
@@ -210,28 +206,44 @@ function setLiveInterim(text, role = "user") {
   if (autoScrollEnabled) scrollToBottom();
 }
 
-// ---------- Data: initial load + realtime ----------
+/* ---------- Data: initial load + realtime ---------- */
 
 async function loadInitial(callId) {
   clearUI();
   setLive(false);
-
   if (!callId) return;
 
+  // IMPORTANT: order by created_at (your table has it; timestamp may not)
+  // Also keep timestamp in select just in case, but we do not rely on it.
   const { data, error } = await supabase
     .from("call_sessions")
-    .select("input_transcript, ai_text, timestamp, created_at")
+    .select("call_id, input_transcript, ai_text, created_at, timestamp")
     .eq("call_id", callId)
-    .order("timestamp", { ascending: true });
+    .order("created_at", { ascending: true });
 
+  // If schema drifted and call_id column is named differently, attempt fallback.
   if (error) {
-    console.warn("[transcript] error loading call_sessions:", error);
-    appendTurn(
-      "assistant",
-      "I wasn't able to load the transcript for this call yet.",
-      new Date(),
-      { animate: false }
-    );
+    console.warn("[transcript] error loading call_sessions (call_id):", error);
+
+    const alt = await supabase
+      .from("call_sessions")
+      .select("callId, input_transcript, ai_text, created_at, timestamp")
+      .eq("callId", callId)
+      .order("created_at", { ascending: true });
+
+    if (alt.error) {
+      console.warn("[transcript] error loading call_sessions (callId):", alt.error);
+      appendTurn(
+        "assistant",
+        "I wasn't able to load the transcript for this call yet.",
+        new Date(),
+        { animate: false }
+      );
+      return;
+    }
+
+    (alt.data || []).forEach((row) => handleRow(row, { animate: false }));
+    scrollToBottom();
     return;
   }
 
@@ -250,13 +262,13 @@ function subscribeRealtime(callId) {
     return;
   }
 
-  // NEW: when embedded inside call.html, live updates come from call.js
-  // via postMessage, so we *don't* need Supabase realtime here.
+  // In embed mode, parent (call.js) drives live updates via postMessage.
   if (isEmbed) {
     setLive(true);
     return;
   }
 
+  // Standalone mode: realtime inserts
   realtimeChannel = supabase
     .channel(`call_sessions_${callId}`)
     .on(
@@ -267,13 +279,9 @@ function subscribeRealtime(callId) {
         table: "call_sessions",
         filter: `call_id=eq.${callId}`,
       },
-      (payload) => {
-        handleRow(payload.new, { animate: true });
-      }
+      (payload) => handleRow(payload.new, { animate: true })
     )
-    .subscribe((status) => {
-      setLive(status === "SUBSCRIBED");
-    });
+    .subscribe((status) => setLive(status === "SUBSCRIBED"));
 }
 
 async function watchCallId(callId) {
@@ -285,19 +293,17 @@ async function watchCallId(callId) {
   subscribeRealtime(currentCallId);
 }
 
-// ---------- UX helpers ----------
+/* ---------- UX helpers ---------- */
 
 function chooseStartCallId() {
   const fromQuery = params.get("call_id") || params.get("callId");
   if (fromQuery) return fromQuery;
 
-  // When embedded inside call.html, prefer the last_call_id from localStorage
   if (isEmbed) {
     const stored = window.localStorage.getItem("last_call_id");
     if (stored) return stored;
   }
 
-  // Standalone page: prefer the input field, then last_call_id.
   if (els.callIdInput && els.callIdInput.value.trim()) {
     return els.callIdInput.value.trim();
   }
@@ -306,82 +312,68 @@ function chooseStartCallId() {
   return stored || "";
 }
 
-// ---------- Event wiring ----------
+/* ---------- Event wiring ---------- */
 
-if (els.watchBtn) {
-  els.watchBtn.addEventListener("click", (e) => {
-    e.preventDefault();
-    const id = (els.callIdInput?.value || "").trim();
-    if (!id) return;
-    watchCallId(id);
+els.watchBtn?.addEventListener("click", (e) => {
+  e.preventDefault();
+  const id = (els.callIdInput?.value || "").trim();
+  if (!id) return;
+  watchCallId(id);
+});
+
+els.autoScrollBtn?.addEventListener("click", () => {
+  autoScrollEnabled = !autoScrollEnabled;
+  updateAutoScrollUI();
+  if (autoScrollEnabled) scrollToBottom();
+});
+
+els.copyBtn?.addEventListener("click", () => {
+  if (!cache.length) return;
+  const text = cache
+    .map((t) => {
+      const who = t.role === "assistant" ? "Blake" : "You";
+      return `[${fmtTime(t.ts)}] ${who}: ${t.text}`;
+    })
+    .join("\n");
+  if (!text) return;
+  window.navigator.clipboard?.writeText(text).catch(() => {});
+});
+
+els.downloadBtn?.addEventListener("click", () => {
+  if (!cache.length) return;
+  const blob = new Blob([JSON.stringify(cache, null, 2)], {
+    type: "application/json",
   });
-}
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `sow-transcript-${currentCallId || "call"}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
 
-if (els.autoScrollBtn) {
-  els.autoScrollBtn.addEventListener("click", () => {
-    autoScrollEnabled = !autoScrollEnabled;
-    updateAutoScrollUI();
-    if (autoScrollEnabled) scrollToBottom();
-  });
-}
+els.closeBtn?.addEventListener("click", (e) => {
+  e.preventDefault();
+  if (!isEmbed && window.close) window.close();
+  else window.parent?.postMessage?.({ type: "sow-close-transcript" }, "*");
+});
 
-if (els.copyBtn) {
-  els.copyBtn.addEventListener("click", () => {
-    if (!cache.length) return;
-    const text = cache
-      .map((t) => {
-        const who = t.role === "assistant" ? "Blake" : "You";
-        return `[${fmtTime(t.ts)}] ${who}: ${t.text}`;
-      })
-      .join("\n");
-    if (!text) return;
-    window.navigator.clipboard?.writeText(text).catch(() => {});
-  });
-}
-
-if (els.downloadBtn) {
-  els.downloadBtn.addEventListener("click", () => {
-    if (!cache.length) return;
-    const blob = new Blob([JSON.stringify(cache, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `sow-transcript-${currentCallId || "call"}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  });
-}
-
-if (els.closeBtn) {
-  els.closeBtn.addEventListener("click", (e) => {
-    e.preventDefault();
-    if (!isEmbed && window.close) {
-      window.close();
-    } else {
-      // In embed mode, let the parent decide what to do (no-op if ignored).
-      window.parent?.postMessage?.({ type: "sow-close-transcript" }, "*");
-    }
-  });
-}
-
-// ---------- NEW: live events from call.js when embedded ----------
+/* ---------- Embed mode: accept live postMessage from call.js ---------- */
 
 window.addEventListener("message", (event) => {
+  // In embed mode, only accept messages from our parent window
+  if (isEmbed && event.source !== window.parent) return;
+
   const data = event.data || {};
-  // Only handle messages coming from our call page
   if (data.source && data.source !== "sow-call") return;
 
   const type = data.type;
   const text = data.text || "";
   const speaker = data.speaker === "assistant" ? "assistant" : "user";
-
   if (!type) return;
 
-  // As soon as we receive something from call.js, mark LIVE.
   if (isEmbed) setLive(true);
 
   switch (type) {
@@ -392,8 +384,7 @@ window.addEventListener("message", (event) => {
       setLiveInterim(text, speaker);
       break;
     case "final":
-    case "ai_final":
-      // Promote interim to final turn
+      // clear interim first, then append final
       setLiveInterim("", speaker);
       appendTurn(speaker, text, new Date(), { animate: false });
       break;
@@ -402,26 +393,29 @@ window.addEventListener("message", (event) => {
   }
 });
 
-// ---------- Boot ----------
+/* ---------- Boot ---------- */
 
 if (isEmbed) {
-  // Mark that transcript.html is inside the call page panel
   document.body.classList.add("embed");
-
-  // Hide the Call ID input/footer for embed mode
-  if (els.footer) {
-    els.footer.style.display = "none";
-  }
+  if (els.footer) els.footer.style.display = "none";
 }
 
 updateAutoScrollUI();
 
 const startId = chooseStartCallId();
-if (startId) {
-  watchCallId(startId);
-} else {
+if (startId) watchCallId(startId);
+else {
   clearUI();
   setLive(false);
+}
+
+// ✅ Embed ready handshake so parent can flush queued transcript events (prevents missing greeting)
+if (isEmbed) {
+  try {
+    window.parent?.postMessage?.({ source: "sow-transcript", type: "ready" }, "*");
+  } catch {
+    // ignore
+  }
 }
 
 console.log("[SOW] transcript.js ready");

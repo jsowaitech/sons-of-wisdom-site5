@@ -1,6 +1,9 @@
 // netlify/functions/call-greeting.js
-// Son of Wisdom — Dynamic AI greeting
-// Returns JSON: { text, audio_base64, mime }
+// Son of Wisdom — Dynamic AI greeting (ALWAYS transcribable)
+// Returns JSON: { text, assistant_text, audio_base64, mime, call_id }
+//
+// ✅ No static mp3 fallback.
+// If ElevenLabs is not configured or fails, returns an error so the client can retry.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -14,8 +17,13 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
+function mustHave(value, name) {
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+}
+
 async function openaiChat(messages, opts = {}) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+  mustHave(OPENAI_API_KEY, "OPENAI_API_KEY");
 
   const body = {
     model: OPENAI_MODEL,
@@ -43,10 +51,11 @@ async function openaiChat(messages, opts = {}) {
 }
 
 async function elevenLabsTTS(text) {
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return null;
+  mustHave(ELEVENLABS_API_KEY, "ELEVENLABS_API_KEY");
+  mustHave(ELEVENLABS_VOICE_ID, "ELEVENLABS_VOICE_ID");
 
   const trimmed = (text || "").trim();
-  if (!trimmed) return null;
+  if (!trimmed) throw new Error("Empty greeting text");
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
 
@@ -73,10 +82,6 @@ async function elevenLabsTTS(text) {
   return { audio_base64: buf.toString("base64"), mime: "audio/mpeg" };
 }
 
-function fallbackGreetingText() {
-  return "Alright brother. I’m here with you. Tell me what’s going on today.";
-}
-
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: corsHeaders, body: "" };
@@ -93,7 +98,9 @@ exports.handler = async (event) => {
     const body = JSON.parse(event.body || "{}");
     const userId = (body.user_id || "").toString().trim();
     const deviceId = (body.device_id || "").toString().trim();
+    const callId = (body.call_id || body.callId || "").toString().trim();
 
+    // Keep greeting short & TTS friendly
     const system = `You are AI Blake, a concise masculine Christian coach for Son of Wisdom.
 Return a single short greeting (1–2 sentences) inviting the user to speak.
 No markdown, no bullet points, plain text only.`;
@@ -102,48 +109,38 @@ No markdown, no bullet points, plain text only.`;
 User: ${userId || "unknown"}
 Device: ${deviceId || "unknown"}`;
 
-    let text = "";
-    try {
-      text = await openaiChat(
-        [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        { temperature: 0.9, maxTokens: 90 }
-      );
-    } catch (e) {
-      console.error("[call-greeting] OpenAI failed:", e);
-      text = fallbackGreetingText();
-    }
+    const text = await openaiChat(
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      { temperature: 0.9, maxTokens: 90 }
+    );
 
-    // TTS is best-effort; if it fails, we still return text.
-    let audio = null;
-    try {
-      audio = await elevenLabsTTS(text);
-    } catch (e) {
-      console.error("[call-greeting] ElevenLabs failed:", e);
-      audio = null;
-    }
+    // ✅ REQUIRED: always return AI audio as base64 for transcribable greeting playback
+    const audio = await elevenLabsTTS(text);
 
     return {
       statusCode: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
-        audio_base64: audio?.audio_base64 || null,
-        mime: audio?.mime || "audio/mpeg",
+        assistant_text: text, // ✅ Option A: always present
+        audio_base64: audio.audio_base64,
+        mime: audio.mime || "audio/mpeg",
+        call_id: callId || null,
       }),
     };
   } catch (err) {
     console.error("[call-greeting] error:", err);
-    // Even on hard failure, return fallback text so client can still transcribe.
     return {
-      statusCode: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      statusCode: 500,
+      headers: corsHeaders,
       body: JSON.stringify({
-        text: fallbackGreetingText(),
-        audio_base64: null,
-        mime: "audio/mpeg",
+        error: "Server error",
+        detail: String(err),
+        hint:
+          "Greeting has no static fallback now. Ensure ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are set in Netlify env.",
       }),
     };
   }

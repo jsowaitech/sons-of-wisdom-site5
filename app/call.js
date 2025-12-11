@@ -1,9 +1,13 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// - Continuous VAD recording → Supabase (optional) + Netlify call-coach → AI audio reply
-// - Web Speech API captions + optional Hume realtime (safely stubbed)
-// - Dynamic AI greeting audio via Netlify function + ElevenLabs
-// - Conversation threads: can title an untitled conversation from first transcript
+// UPDATED: adds idle-detection + system_event calls to call-coach
+// - If user doesn't respond after AI finishes:
+//   1) Blake sends a nudge (system_event: no_response_nudge)
+//   2) Then Blake sends an ending line (system_event: no_response_end) and call ends
+//
+// Assumes your netlify/functions/call-coach.js supports:
+//  - system_event: "no_response_nudge" | "no_response_end"
+//  - returns JSON with assistant_text + audio_base64 (+ mime)
 
 import { supabase } from "./supabase.js";
 
@@ -159,9 +163,26 @@ let speakerMuted = false;
 
 /* Greeting prefetch state */
 let greetingReadyPromise = null;
+let greetingPayload = null; // { text/assistant_text, audio_base64, mime }
 let greetingAudioUrl = null;
-// store greeting text for transcript
-let greetingTextCached = "";
+
+/* ---------- NEW: Idle detection (no response) ---------- */
+const NO_RESPONSE = {
+  // after AI finishes speaking, wait this long for user to speak
+  FIRST_NUDGE_MS: 12_000,
+  // after the nudge is spoken, wait this long for user to speak
+  END_CALL_MS: 12_000,
+  // minimum time after AI speech before any idle logic can run
+  ARM_DELAY_MS: 600,
+};
+
+let idleArmed = false;
+let idleStep = 0; // 0=none, 1=nudged
+let idleTimer1 = null;
+let idleTimer2 = null;
+let lastUserActivityAt = Date.now(); // updated on speech/interim/final and when capture starts
+let lastAIFinishedAt = 0; // set when AI audio finishes (or is interrupted)
+let idleInFlight = false;
 
 /* ---------- Helpers ---------- */
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -231,6 +252,17 @@ function sendAssistantTextToTranscript(text) {
   });
 }
 
+/* Helper to send assistant interim text (optional) */
+function sendAssistantInterimToTranscript(text) {
+  const s = (text || "").trim();
+  if (!s) return;
+  postToTranscriptPanel({
+    type: "interim",
+    text: s,
+    speaker: "assistant",
+  });
+}
+
 /* Derive a short conversation title from first user utterance */
 function deriveTitleFromText(raw) {
   let t = (raw || "").replace(/\s+/g, " ").trim();
@@ -273,6 +305,175 @@ async function maybeUpdateConversationTitleFromTranscript(text) {
   }
 }
 
+/* ---------- NEW: Idle detection helpers ---------- */
+function noteUserActivity() {
+  lastUserActivityAt = Date.now();
+  // if user does anything meaningful, disarm idle logic for this cycle
+  cancelIdleTimers();
+  idleArmed = false;
+  idleStep = 0;
+}
+
+function cancelIdleTimers() {
+  if (idleTimer1) clearTimeout(idleTimer1);
+  if (idleTimer2) clearTimeout(idleTimer2);
+  idleTimer1 = idleTimer2 = null;
+}
+
+function armIdleAfterAI() {
+  cancelIdleTimers();
+  idleArmed = true;
+  idleStep = 0;
+  // schedule first nudge
+  idleTimer1 = setTimeout(() => maybeRunNoResponseNudge(), NO_RESPONSE.FIRST_NUDGE_MS);
+}
+
+function disarmIdle(reason = "") {
+  cancelIdleTimers();
+  idleArmed = false;
+  idleStep = 0;
+  idleInFlight = false;
+  if (reason) log("[SOW] idle disarmed:", reason);
+}
+
+function shouldConsiderIdle() {
+  if (!isCalling) return false;
+  if (isRecording) return false;
+  if (isPlayingAI) return false;
+  if (!idleArmed) return false;
+  // don't fire immediately; give UI a moment
+  if (Date.now() - lastAIFinishedAt < NO_RESPONSE.ARM_DELAY_MS) return false;
+  // if user has done something recently, don't idle
+  if (Date.now() - lastUserActivityAt < 400) return false;
+  return true;
+}
+
+async function callCoachSystemEvent(eventType) {
+  // eventType: "no_response_nudge" | "no_response_end"
+  const user_id = getUserIdForWebhook();
+  const device = getOrCreateDeviceId();
+
+  // ensure call_id exists
+  if (!currentCallId) {
+    try {
+      currentCallId =
+        localStorage.getItem("last_call_id") || crypto.randomUUID();
+      localStorage.setItem("last_call_id", currentCallId);
+    } catch {
+      currentCallId =
+        currentCallId ||
+        `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    }
+  }
+
+  const resp = await fetch(CALL_COACH_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: "voice",
+      user_id,
+      device_id: device,
+      call_id: currentCallId,
+      conversationId: conversationId || null,
+      system_event: eventType,
+    }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`call-coach system_event ${resp.status}: ${t || resp.statusText}`);
+  }
+
+  const data = await resp.json().catch(() => ({}));
+  const text = (data.assistant_text || data.text || "").toString().trim();
+  const b64 = data.audio_base64 || "";
+  const mime = data.mime || "audio/mpeg";
+
+  if (!b64) throw new Error("system_event missing audio_base64");
+  return { text, b64, mime };
+}
+
+function base64ToBlobUrl(b64, mime = "audio/mpeg") {
+  const raw = (b64 || "").includes(",") ? b64.split(",").pop() : b64;
+  const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: mime || "audio/mpeg" });
+  return URL.createObjectURL(blob);
+}
+
+async function playJsonTTS({ text, b64, mime }, { ringColor = "#d4a373" } = {}) {
+  const url = base64ToBlobUrl(b64, mime);
+  try {
+    // mirror text immediately (like Option A)
+    if (text) sendAssistantTextToTranscript(text);
+    await safePlayOnce(url, { limitMs: 60_000, color: ringColor });
+  } finally {
+    try {
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
+async function maybeRunNoResponseNudge() {
+  if (!shouldConsiderIdle()) return;
+  if (idleInFlight) return;
+  if (idleStep !== 0) return;
+
+  idleInFlight = true;
+
+  try {
+    statusText.textContent = "Still there…";
+    const payload = await callCoachSystemEvent("no_response_nudge");
+    if (!isCalling) return;
+
+    // while nudge plays, prevent recording loop from starting
+    isPlayingAI = true;
+    await playJsonTTS(payload, { ringColor: "#d4a373" });
+  } catch (e) {
+    warn("no_response_nudge failed", e);
+  } finally {
+    isPlayingAI = false;
+    idleInFlight = false;
+    if (!isCalling) return;
+
+    // If user started speaking during/after, bail
+    if (Date.now() - lastUserActivityAt < 500) {
+      disarmIdle("user activity after nudge");
+      return;
+    }
+
+    // schedule end call
+    idleStep = 1;
+    idleTimer2 = setTimeout(() => maybeRunNoResponseEnd(), NO_RESPONSE.END_CALL_MS);
+  }
+}
+
+async function maybeRunNoResponseEnd() {
+  if (!shouldConsiderIdle()) return;
+  if (idleInFlight) return;
+  if (idleStep !== 1) return;
+
+  idleInFlight = true;
+
+  try {
+    statusText.textContent = "Ending call…";
+    const payload = await callCoachSystemEvent("no_response_end");
+    if (!isCalling) return;
+
+    isPlayingAI = true;
+    await playJsonTTS(payload, { ringColor: "#d4a373" });
+  } catch (e) {
+    warn("no_response_end failed", e);
+  } finally {
+    isPlayingAI = false;
+    idleInFlight = false;
+    if (!isCalling) return;
+    // end the call regardless (even if the end line failed)
+    endCall();
+  }
+}
+
 /* ---------- History / Summary (Supabase via REST, optional) ---------- */
 async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
   if (!HAS_SUPABASE) {
@@ -280,9 +481,7 @@ async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
   }
   try {
     const uuid = pickUuidForHistory(user_id);
-    const url = new URL(
-      `${SUPABASE_REST}/${encodeURIComponent(HISTORY_TABLE)}`
-    );
+    const url = new URL(`${SUPABASE_REST}/${encodeURIComponent(HISTORY_TABLE)}`);
     url.searchParams.set("select", HISTORY_SELECT);
     url.searchParams.set(HISTORY_USER_COL, `eq.${uuid}`);
     url.searchParams.set("order", `${HISTORY_TIME_COL}.desc`);
@@ -319,9 +518,7 @@ async function fetchRollingSummary(user_id, device) {
   if (!HAS_SUPABASE) return "";
   try {
     const uuid = pickUuidForHistory(user_id);
-    const url = new URL(
-      `${SUPABASE_REST}/${encodeURIComponent(SUMMARY_TABLE)}`
-    );
+    const url = new URL(`${SUPABASE_REST}/${encodeURIComponent(SUMMARY_TABLE)}`);
     url.searchParams.set("user_id_uuid", `eq.${uuid}`);
     url.searchParams.set("device_id", `eq.${device}`);
     url.searchParams.set("select", "summary,last_turn_at");
@@ -439,6 +636,7 @@ function ensureChatUI() {
       if (!txt) return;
       chatInput.value = "";
       appendMsg("me", txt);
+      noteUserActivity(); // NEW: counts as response activity
       await sendChatToN8N(txt);
     });
     chatForm._wired = true;
@@ -505,6 +703,7 @@ const transcriptUI = {
       text,
       speaker: "user",
     });
+    noteUserActivity(); // NEW: interim counts as activity
   },
   addFinalLine(t) {
     const s = (t || "").trim();
@@ -520,6 +719,7 @@ const transcriptUI = {
       text: s,
       speaker: "user",
     });
+    noteUserActivity(); // NEW: final counts as activity
   },
 };
 
@@ -838,59 +1038,81 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------- Greeting prefetch (JSON; always transcribable) ---------- */
+/* ---------- Greeting (ALWAYS transcribable) ---------- */
+async function fetchGreetingJSON() {
+  const user_id = getUserIdForWebhook();
+  const device = getOrCreateDeviceId();
+
+  const resp = await fetch(GREETING_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id, device_id: device }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Greeting HTTP ${resp.status}: ${t || resp.statusText}`);
+  }
+
+  const data = await resp.json().catch(() => ({}));
+  const text = (data.assistant_text || data.text || "").toString().trim();
+  const audio_base64 = data.audio_base64 || "";
+  const mime = data.mime || "audio/mpeg";
+
+  if (!text) throw new Error("Greeting missing text");
+  if (!audio_base64) throw new Error("Greeting missing audio_base64");
+
+  return { text, audio_base64, mime };
+}
+
 async function prepareGreetingForNextCall() {
   greetingReadyPromise = (async () => {
     try {
-      const user_id = getUserIdForWebhook();
-      const device = getOrCreateDeviceId();
+      const payload = await fetchGreetingJSON();
+      greetingPayload = payload;
 
-      const resp = await fetch(GREETING_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id, device_id: device }),
-      });
-
-      if (!resp.ok) throw new Error(`Greeting HTTP ${resp.status}`);
-
-      const ct = (resp.headers.get("content-type") || "").toLowerCase();
-      if (!ct.includes("application/json")) {
-        throw new Error(`Greeting unexpected content-type: ${ct || "unknown"}`);
-      }
-
-      const data = await resp.json().catch(() => null);
-      const text = (data?.text || "").toString().trim();
-
-      greetingTextCached = text || "";
-
-      // audio optional; if missing, we'll play blake.mp3 but still transcribe greetingTextCached
-      const b64 = data?.audio_base64;
-      if (b64) {
-        const raw = b64.includes(",") ? b64.split(",").pop() : b64;
-        const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-        const blob = new Blob([bytes], { type: data?.mime || "audio/mpeg" });
-
-        if (greetingAudioUrl) {
-          try {
-            URL.revokeObjectURL(greetingAudioUrl);
-          } catch (e) {
-            // ignore
-          }
+      if (greetingAudioUrl) {
+        try {
+          URL.revokeObjectURL(greetingAudioUrl);
+        } catch (e) {
+          // ignore
         }
-        greetingAudioUrl = URL.createObjectURL(blob);
-      } else {
-        greetingAudioUrl = null;
       }
-
-      log("[SOW] Greeting prefetched (json).");
+      greetingAudioUrl = base64ToBlobUrl(payload.audio_base64, payload.mime);
+      log("[SOW] Greeting prefetched (JSON).");
       return true;
     } catch (e) {
       warn("Greeting prefetch failed", e);
+      greetingPayload = null;
+      if (greetingAudioUrl) {
+        try {
+          URL.revokeObjectURL(greetingAudioUrl);
+        } catch (err) {
+          // ignore
+        }
+      }
       greetingAudioUrl = null;
-      greetingTextCached = "";
       return false;
     }
   })();
+}
+
+async function ensureGreetingReadyWithRetry() {
+  // If nothing queued, fetch now.
+  if (!greetingReadyPromise) prepareGreetingForNextCall();
+
+  let ok = await greetingReadyPromise;
+  greetingReadyPromise = null; // consumed
+
+  if (ok && greetingPayload && greetingAudioUrl) return true;
+
+  // Retry once (network hiccup / cold start)
+  await new Promise((r) => setTimeout(r, 450));
+  prepareGreetingForNextCall();
+  ok = await greetingReadyPromise;
+  greetingReadyPromise = null;
+
+  return Boolean(ok && greetingPayload && greetingAudioUrl);
 }
 
 /* ---------- Call flow ---------- */
@@ -898,13 +1120,14 @@ async function startCall() {
   if (isCalling) return;
   isCalling = true;
 
+  disarmIdle("startCall");
+  noteUserActivity();
+
   // create a call_id for this session and store it
   try {
     currentCallId = crypto.randomUUID();
   } catch {
-    currentCallId = `call_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2)}`;
+    currentCallId = `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
   try {
     localStorage.setItem("last_call_id", currentCallId);
@@ -923,24 +1146,24 @@ async function startCall() {
     if (!isCalling) return;
 
     // Ensure greeting is ready (or fetch if not)
-    if (!greetingReadyPromise) {
-      prepareGreetingForNextCall();
-    }
-    const greetingOk = await greetingReadyPromise;
-    greetingReadyPromise = null; // next call will refetch
-
+    const greetingOk = await ensureGreetingReadyWithRetry();
     if (!isCalling) return;
 
+    if (!greetingOk) {
+      statusText.textContent =
+        "Greeting failed. Please tap Call again in a moment.";
+      endCall();
+      return;
+    }
+
+    // ✅ Transcribe greeting BEFORE playback (Option A style)
     statusText.textContent = "AI greeting you…";
+    if (greetingPayload?.text) {
+      sendAssistantTextToTranscript(greetingPayload.text);
+    }
 
-    const fallbackGreetingText =
-      "Alright brother. I’m here with you. Tell me what’s going on today.";
-    const greetingText = (greetingTextCached || "").trim() || fallbackGreetingText;
-
-    // ✅ Always transcribe greeting, even if audio falls back
-    sendAssistantTextToTranscript(greetingText);
-
-    if (greetingOk && greetingAudioUrl) {
+    // Play greeting audio from Blob URL (always generated from JSON base64)
+    if (greetingAudioUrl) {
       await safePlayOnce(greetingAudioUrl, { limitMs: 60000 });
       try {
         URL.revokeObjectURL(greetingAudioUrl);
@@ -948,19 +1171,18 @@ async function startCall() {
         // ignore
       }
       greetingAudioUrl = null;
-    } else {
-      // fallback audio (but still transcribed via greetingText)
-      await safePlayOnce("blake.mp3", { limitMs: 15000 });
     }
+
     if (!isCalling) return;
 
     // Prepare next greeting in the background
+    greetingPayload = null;
     prepareGreetingForNextCall();
 
     await startRecordingLoop();
   } catch (e) {
     warn("startCall error", e);
-    statusText.textContent = "Audio blocked or missing. Tap again.";
+    statusText.textContent = "Audio blocked or greeting failed. Tap again.";
     resetCallTimer();
     isCalling = false;
     callBtn.classList.remove("call-active");
@@ -971,6 +1193,9 @@ function endCall() {
   isCalling = false;
   isRecording = false;
   isPlayingAI = false;
+
+  disarmIdle("endCall");
+
   callBtn.classList.remove("call-active");
   statusText.textContent = "Call ended.";
   stopCallTimer();
@@ -1002,6 +1227,16 @@ function endCall() {
     }
     managedAudios.delete(el);
   }
+
+  // cleanup greeting url if any
+  if (greetingAudioUrl) {
+    try {
+      URL.revokeObjectURL(greetingAudioUrl);
+    } catch (e) {
+      // ignore
+    }
+    greetingAudioUrl = null;
+  }
 }
 
 /* Small one-shot clips (ring/greeting/others) */
@@ -1012,26 +1247,29 @@ function safePlayOnce(src, { limitMs = 15000, color = "#d4a373" } = {}) {
     registerAudioElement(a);
     animateRingFromElement(a, color);
     let done = false;
-    const settle = () => {
+
+    const settle = (ok) => {
       if (done) return;
       done = true;
       a.onended = a.onerror = a.onabort = a.oncanplaythrough = null;
       stopRing();
-      res(true);
+      res(ok);
     };
+
     a.oncanplaythrough = () => {
       try {
-        a.play().catch(() => res(false));
+        a.play().catch(() => settle(false));
       } catch (e) {
-        res(false);
+        settle(false);
       }
     };
-    a.onerror = () => res(false);
-    a.onabort = () => res(false);
-    const t = setTimeout(() => res(false), limitMs);
+    a.onerror = () => settle(false);
+    a.onabort = () => settle(false);
+
+    const t = setTimeout(() => settle(false), limitMs);
     a.onended = () => {
       clearTimeout(t);
-      settle();
+      settle(true);
     };
   });
 }
@@ -1096,6 +1334,7 @@ function openNativeRecognizer() {
     }
     transcriptUI.setInterim(interim);
     interimBuffer = interim;
+    if (interim) noteUserActivity(); // NEW
   };
 
   r.onerror = (e) => {
@@ -1143,9 +1382,13 @@ function closeNativeRecognizer() {
 async function captureOneTurn() {
   if (!isCalling || isRecording || isPlayingAI) return false;
 
+  // NEW: if idle timers were armed, cancel — we're capturing user now
+  disarmIdle("captureOneTurn");
+
   finalSegments = [];
   interimBuffer = "";
   transcriptUI.setInterim("Listening…");
+  noteUserActivity(); // NEW
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -1160,6 +1403,7 @@ async function captureOneTurn() {
       return false;
     }
     globalStream = stream;
+    updateMicTracks(); // respects micMuted state
 
     let opts = {};
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
@@ -1174,6 +1418,7 @@ async function captureOneTurn() {
     } catch (e) {
       mediaRecorder = new MediaRecorder(stream);
     }
+
     recordChunks = [];
     isRecording = true;
 
@@ -1183,6 +1428,7 @@ async function captureOneTurn() {
         HumeRealtime.handleRecorderChunk?.(e.data);
       }
     };
+
     mediaRecorder.onstop = () => {
       commitInterimToFinal();
       isRecording = false;
@@ -1205,6 +1451,7 @@ async function captureOneTurn() {
       };
       wait();
     });
+
     return true;
   } catch (e) {
     warn("captureOneTurn error", e);
@@ -1225,9 +1472,6 @@ let bargeCtx = null;
 let bargeSrc = null;
 let bargeAnalyser = null;
 let bargeRAF = null;
-let bargeArmed = false;
-let bargeSinceArm = 0;
-let bargeOnInterrupt = null;
 
 async function ensureLiveMicForBargeIn() {
   try {
@@ -1267,12 +1511,11 @@ function startBargeInMonitor(onInterrupt) {
   bargeAnalyser.fftSize = 1024;
   bargeAnalyser.smoothingTimeConstant = 0.8;
   bargeSrc.connect(bargeAnalyser);
-  bargeArmed = false;
-  bargeSinceArm = 0;
-  bargeOnInterrupt = onInterrupt;
 
   const data = new Uint8Array(bargeAnalyser.fftSize);
   let hold = 0;
+  let armed = false;
+  let sinceArm = 0;
 
   const loop = () => {
     if (!bargeAnalyser) return;
@@ -1284,9 +1527,9 @@ function startBargeInMonitor(onInterrupt) {
     }
     const rms = Math.sqrt(sum / data.length);
 
-    if (!bargeArmed) {
-      bargeSinceArm += 16;
-      if (bargeSinceArm >= BARGE.cooldownMs) bargeArmed = true;
+    if (!armed) {
+      sinceArm += 16;
+      if (sinceArm >= BARGE.cooldownMs) armed = true;
     } else {
       if (rms > BARGE.rmsThresh) {
         hold += 16;
@@ -1305,6 +1548,7 @@ function startBargeInMonitor(onInterrupt) {
     }
     bargeRAF = requestAnimationFrame(loop);
   };
+
   bargeRAF = requestAnimationFrame(loop);
 }
 
@@ -1325,7 +1569,6 @@ function stopBargeInMonitor() {
     }
   }
   bargeCtx = bargeSrc = bargeAnalyser = null;
-  bargeOnInterrupt = null;
 }
 
 /* Unified AI playback that supports barge-in and optional live transcription */
@@ -1337,13 +1580,17 @@ async function playAIWithBargeIn(
     statusText.textContent = "AI replying…";
     isPlayingAI = true;
 
+    // during AI playback, don't run idle timers
+    disarmIdle("AI playback start");
+
     const a = new Audio(playableUrl);
     registerAudioElement(a);
     animateRingFromElement(a, "#d4a373");
 
-    // live transcription webhook if configured
+    // live transcription webhook if configured (assistant interim/final)
     if (!aiBubbleEl && inChatView)
       aiBubbleEl = appendMsg("ai", "", { typing: true });
+
     if (aiBlob && N8N_TRANSCRIBE_URL) {
       try {
         liveTranscribeBlob(aiBlob, aiBubbleEl).catch(() => {});
@@ -1359,6 +1606,11 @@ async function playAIWithBargeIn(
       stopRing();
       stopBargeInMonitor();
       isPlayingAI = false;
+
+      // NEW: mark AI finished and arm idle timers for no-response flow
+      lastAIFinishedAt = Date.now();
+      if (isCalling) armIdleAfterAI();
+
       resolve({ interrupted });
     };
 
@@ -1371,6 +1623,10 @@ async function playAIWithBargeIn(
           // ignore
         }
         statusText.textContent = "Go ahead…";
+
+        // user is interrupting -> counts as activity
+        noteUserActivity();
+
         cleanup();
       });
     }
@@ -1384,7 +1640,7 @@ async function playAIWithBargeIn(
   });
 }
 
-/* ---------- Voice path: upload → Supabase (optional) → call-coach (transcript only) ---------- */
+/* ---------- Voice path: upload → Supabase (optional) → call-coach ---------- */
 const RECENT_USER_KEEP = 12;
 let recentUserTurns = [];
 
@@ -1394,7 +1650,9 @@ async function uploadRecordingAndNotify() {
   const finalText = finalSegments.join(" ").trim();
   const interimText = (interimBuffer || "").trim();
   const combinedTranscript = finalText || interimText || "";
+
   if (combinedTranscript) {
+    noteUserActivity(); // NEW: user spoke
     recentUserTurns.push(combinedTranscript);
     if (recentUserTurns.length > RECENT_USER_KEEP) {
       recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
@@ -1440,12 +1698,14 @@ async function uploadRecordingAndNotify() {
   } catch (e) {
     // ignore; we already log inside helper
   }
+
   const prevSummary = await fetchRollingSummary(user_id, device);
   const rollingSummary = buildRollingSummary(
     prevSummary,
     historyPairs,
     combinedTranscript
   );
+
   const transcriptForModel = historyPairsText
     ? `Previous conversation (last ${Math.min(
         historyPairs.length,
@@ -1487,13 +1747,16 @@ async function uploadRecordingAndNotify() {
   let revokeLater = null;
   let aiBlob = null;
   let aiTextFromJSON = "";
+
   try {
     const body = {
       user_id,
       device_id: device,
       call_id: currentCallId,
-      // NEW: pass the current utterance separately so backend can log it cleanly
+
+      // pass the current utterance separately so backend can log it cleanly
       user_turn: combinedTranscript,
+
       transcript: transcriptForModel,
       has_transcript: !!transcriptForModel,
       history_user_last3: recentUserTurns.slice(-3),
@@ -1501,8 +1764,11 @@ async function uploadRecordingAndNotify() {
       executionMode: "production",
       source: "voice",
       audio_uploaded: uploaded,
-      // ✅ ensure the backend can link to the same conversation thread
+
+      // pass conversation/thread if present
       conversationId: conversationId || null,
+      conversation_id: conversationId || null,
+      c: conversationId || null,
     };
 
     const resp = await fetch(CALL_COACH_ENDPOINT, {
@@ -1513,7 +1779,7 @@ async function uploadRecordingAndNotify() {
 
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
 
-    // progressive stream first (kept for compatibility; call-coach currently returns JSON or audio)
+    // progressive stream first (kept for compatibility; call-coach may return audio)
     if (
       ENABLE_STREAMED_PLAYBACK &&
       ct.includes("audio/webm") &&
@@ -1521,6 +1787,10 @@ async function uploadRecordingAndNotify() {
     ) {
       const ok = await playStreamedWebmOpus(resp.clone());
       if (ok) {
+        // AI finished speaking; arm idle
+        lastAIFinishedAt = Date.now();
+        if (isCalling) armIdleAfterAI();
+
         upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
         return true;
       }
@@ -1532,18 +1802,25 @@ async function uploadRecordingAndNotify() {
       revokeLater = aiPlayableUrl;
     } else if (ct.includes("application/json")) {
       const data = await resp.json();
-      aiTextFromJSON =
+
+      // ✅ Option A: use assistant_text if provided
+      aiTextFromJSON = (
         data?.assistant_text ??
         data?.text ??
         data?.transcript ??
         data?.message ??
-        "";
+        ""
+      )
+        .toString()
+        .trim();
+
       const b64 = data?.audio_base64;
       const url =
         data?.result_audio_url ||
         data?.audioUrl ||
         data?.url ||
         data?.fileUrl;
+
       if (b64 && !url) {
         const raw = b64.includes(",") ? b64.split(",").pop() : b64;
         const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
@@ -1574,6 +1851,11 @@ async function uploadRecordingAndNotify() {
     return false;
   }
 
+  // ✅ Mirror assistant text into transcript panel immediately (Option A)
+  if (aiTextFromJSON) {
+    sendAssistantTextToTranscript(aiTextFromJSON);
+  }
+
   // If JSON gave us text and chat is open, type it
   let aiBubble = null;
   if (inChatView) {
@@ -1585,17 +1867,13 @@ async function uploadRecordingAndNotify() {
     aiBlob: !aiTextFromJSON ? aiBlob : null,
     aiBubbleEl: aiBubble,
   });
+
   if (revokeLater) {
     try {
       URL.revokeObjectURL(revokeLater);
     } catch (e) {
       // ignore
     }
-  }
-
-  // Mirror assistant text into the live transcript panel (Option A)
-  if (aiTextFromJSON) {
-    sendAssistantTextToTranscript(aiTextFromJSON);
   }
 
   upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
@@ -1630,12 +1908,7 @@ async function liveTranscribeBlob(blob, aiBubbleEl) {
           if (evt.delta) {
             full += evt.delta;
             if (aiBubbleEl) aiBubbleEl.textContent = full;
-            // send as assistant interim text
-            postToTranscriptPanel({
-              type: "interim",
-              text: full,
-              speaker: "assistant",
-            });
+            sendAssistantInterimToTranscript(full);
           }
           if (evt.text && evt.done) {
             if (aiBubbleEl) aiBubbleEl.textContent = evt.text;
@@ -1700,12 +1973,10 @@ async function sendChatToN8N(userText) {
   } catch (e) {
     // ignore
   }
+
   const prevSummary = await fetchRollingSummary(user_id, device);
-  const rollingSummary = buildRollingSummary(
-    prevSummary,
-    historyPairs,
-    userText
-  );
+  const rollingSummary = buildRollingSummary(prevSummary, historyPairs, userText);
+
   const transcriptForModel = historyPairsText
     ? `Previous conversation (last ${Math.min(
         historyPairs.length,
@@ -1725,7 +1996,6 @@ async function sendChatToN8N(userText) {
         rolling_summary: rollingSummary || undefined,
         executionMode: "production",
         source: "chat",
-        conversationId: conversationId || null,
       }),
     });
 
@@ -1770,6 +2040,7 @@ async function sendChatToN8N(userText) {
     const aiBubble = appendMsg("ai", "", { typing: true });
     if (aiText) {
       await typewriter(aiBubble, aiText, 18);
+      // also mirror assistant text to the live transcript panel
       sendAssistantTextToTranscript(aiText);
     }
 
@@ -1786,6 +2057,7 @@ async function sendChatToN8N(userText) {
         }
       }
     }
+
     upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
   } catch (e) {
     warn("chat error", e);
@@ -1866,6 +2138,7 @@ async function playStreamedWebmOpus(response) {
         }
       }
     });
+
     pump().catch(() => {
       try {
         ms.endOfStream();
@@ -1876,6 +2149,11 @@ async function playStreamedWebmOpus(response) {
 
     await new Promise((r) => (a.onended = r));
     URL.revokeObjectURL(url);
+
+    // NEW: streamed AI done, arm idle
+    lastAIFinishedAt = Date.now();
+    if (isCalling) armIdleAfterAI();
+
     return true;
   } catch (e) {
     return null;

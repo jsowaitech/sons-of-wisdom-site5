@@ -10,7 +10,7 @@
 <body class="sow-shell page-call">
   <!-- App bar -->
   <header class="appbar">
-    <!-- Back to main chat (fresh) -->
+    <!-- Back to main chat (same thread) -->
     <button
       id="btn-back-home"
       class="icon-btn"
@@ -96,16 +96,13 @@
           </div>
 
           <!-- Mode toggle -->
-          <div
-            class="row"
-            style="margin-top:0.75rem;justify-content:center;gap:0.5rem;"
-          >
+          <div class="row" style="margin-top:0.75rem;justify-content:center;gap:0.5rem;">
             <button
               id="mode-btn"
               class="btn pill small"
               type="button"
               aria-pressed="false"
-              title="Switch between Call and Chat view"
+              title="Switch to Chat (same conversation)"
             >
               Switch to Chat
             </button>
@@ -131,17 +128,33 @@
     Built for sons, warriors, and kings learning to govern their homes.
   </footer>
 
-  <!-- Back to home -->
+  <!-- Back to home (same conversation) + optional iframe param wiring -->
   <script type="module">
+    const params = new URLSearchParams(window.location.search);
+    const conversationId = params.get("c");
+
+    // Preserve conversation when leaving call mode
     const backBtn = document.getElementById("btn-back-home");
     if (backBtn) {
       backBtn.addEventListener("click", (e) => {
         e.preventDefault();
         const url = new URL("home.html", window.location.origin);
-        url.searchParams.set("new", "1");
-        url.searchParams.set("ts", Date.now().toString());
+        if (conversationId) url.searchParams.set("c", conversationId);
         window.location.replace(url.toString());
       });
+    }
+
+    // Nice-to-have: if call.js stored last_call_id, include it for initial transcript load
+    const frame = document.getElementById("callTranscriptFrame");
+    try {
+      const callId = window.localStorage.getItem("last_call_id");
+      if (frame && callId) {
+        const u = new URL(frame.getAttribute("src"), window.location.origin);
+        u.searchParams.set("call_id", callId);
+        frame.setAttribute("src", u.toString().replace(window.location.origin, ""));
+      }
+    } catch (e) {
+      // ignore
     }
   </script>
 

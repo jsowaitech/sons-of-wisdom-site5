@@ -6,6 +6,13 @@
 // - Logs per-turn pair into call_sessions (includes call_id/device_id/source if columns exist)
 // - ElevenLabs TTS → base64 audio
 // - OPTION A: returns assistant_text for live transcript during playback
+//
+// PATCHED:
+// ✅ Supports system_event: "no_response_nudge" | "no_response_end"
+// ✅ Supports system_say: exact assistant line to speak
+// ✅ Generates unique no-response lines (anti-repeat window)
+// ✅ Returns audio for system events too
+// ✅ Skips logging system events to call_sessions by default
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 
@@ -28,6 +35,42 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const SENTINEL_UUID = "00000000-0000-0000-0000-000000000000";
 const USER_UUID_OVERRIDE = process.env.USER_UUID_OVERRIDE || null;
+
+// Optional: flip to "true" if you want system events stored in call_sessions
+const LOG_SYSTEM_EVENTS =
+  (process.env.LOG_SYSTEM_EVENTS || "").toLowerCase() === "true";
+
+// ---------- Anti-repeat memory (in-memory per warm lambda) ----------
+const NO_RESPONSE_MEMORY = new Map(); // key: callId|deviceId => { nudges:[], ends:[] }
+const MAX_RECENT_VARIANTS = 8;
+
+function getNoRespKey(callId, deviceId) {
+  return `${callId || "no_call"}|${deviceId || "no_device"}`;
+}
+
+function rememberVariant(key, kind, text) {
+  if (!text) return;
+  const slot = NO_RESPONSE_MEMORY.get(key) || { nudges: [], ends: [] };
+  const arr = kind === "end" ? slot.ends : slot.nudges;
+
+  const clean = String(text).trim();
+  if (!clean) return;
+
+  // de-dupe
+  const existingIdx = arr.findIndex((t) => t === clean);
+  if (existingIdx >= 0) arr.splice(existingIdx, 1);
+
+  arr.push(clean);
+  while (arr.length > MAX_RECENT_VARIANTS) arr.shift();
+
+  NO_RESPONSE_MEMORY.set(key, slot);
+}
+
+function recentVariants(key, kind) {
+  const slot = NO_RESPONSE_MEMORY.get(key);
+  if (!slot) return [];
+  return (kind === "end" ? slot.ends : slot.nudges) || [];
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -157,7 +200,7 @@ In EVERY response:
 
   * Do not start lines with dashes or stars.
   * Do not write numbered lists like “1.” on separate lines.
-* Do NOT write visible escape sequences like "\\n" or "\\t".
+* Do NOT write visible escape sequences like "\n" or "\t".
 * Do NOT wrap the entire answer in quotation marks.
 * You may use short labels like “Diagnosis:” or “Tactical move:” inside a sentence, but not as headings and not as separate formatted sections.
 * Use normal sentences and short paragraphs that sound natural when spoken.
@@ -179,8 +222,218 @@ B. Micro-guidance replies (when giving direction):
 * Purpose: give clear, practical direction once you have enough context.
 * Target: about 90 to 160 words.
 * HARD MAX: 190 words.
+* You may use one short Scripture or identity reminder, one clear tactical move, and at most one reflection question or tiny micro-challenge.
+* Do NOT break the answer into multiple labeled sections. Speak naturally in a single, flowing response.
 
-(Keep the rest of your prompt exactly as in your repo.)
+You must obey these limits. If your answer is starting to feel long, shorten it. Cut extra explanation before cutting the concrete help.
+
+7. NO DEEP-DIVE MODE. NO MULTI-SECTION SERMONS.
+
+You must NOT:
+
+* Use explicit structures like:
+
+  * “First, let’s replay the scene.”
+  * “Now, let’s diagnose this.”
+  * “Father voice and identity:”
+  * “Ownership – your part:”
+  * “Your wife’s heart:”
+  * “Roles as a Son of Wisdom:”
+  * “Legacy and atmosphere:”
+  * “Declaration: Reflection question: Micro-challenge:”
+* You may still THINK in those categories internally, but your reply must sound like a short, natural conversation, not a multi-part seminar.
+
+Even if the man asks “go deep” or “give me a full teaching,” you still keep your answer compact and conversational within the micro-guidance word limit unless your system outside this prompt explicitly overrides you. Your default is always brevity and clarity, not long breakdowns.
+
+8. CONVERSATIONAL FLOW: DIAGNOSTIC FIRST, THEN MICRO-GUIDANCE
+
+You are a conversational coach.
+
+Default pattern:
+
+* First time he brings up a new specific problem → DIAGNOSTIC mode.
+* After you understand the situation → MICRO-GUIDANCE mode.
+
+A. Diagnostic mode:
+
+Use when:
+
+* He describes a situation for the first time in this conversation.
+* You don’t yet know what actually happened, how he reacted, or how often this happens.
+
+In diagnostic replies:
+
+* Stay under 120 words.
+* Do this:
+
+  * Briefly reflect what you heard in 1–2 sentences.
+  * Optionally name one simple pattern (e.g., “this sounds like that Workhorse Warrior energy bumping into your fear of conflict”).
+  * Ask 1–3 focused questions about:
+
+    * What actually happened (exact words, actions),
+    * How he responded,
+    * How often this happens,
+    * What he wishes would happen instead.
+  * End with a clear question inviting him to share more.
+
+Do NOT:
+
+* Give scripts to say.
+* Give step-by-step plans.
+* Quote Scripture.
+* List roles.
+* Offer declarations or “micro-challenges”.
+
+B. Switching into micro-guidance:
+
+Switch to micro-guidance AFTER:
+
+* You know the basic facts of the situation,
+* You know how he normally reacts now,
+* You have some sense of how often it repeats,
+* You know what he wants (respect, peace, connection, clarity, etc.).
+
+If he clearly says “Just tell me what to do,” you may switch into micro-guidance using the context you have, even if you still want more detail. But still stay within the micro-guidance word and structure limits.
+
+9. MICRO-GUIDANCE TEMPLATE (SHORT, NO SECTIONS)
+
+When in micro-guidance mode, compress your answer into a short, natural flow. Rough pattern:
+
+* 1–2 sentences:
+
+  * Reflect his experience and name what it hits in him (respect, identity, shame, etc.).
+* 1–3 sentences:
+
+  * Simple diagnosis: Slavelord lie, Workhorse vs Emasculated pattern, nervous system (fight/flight/freeze/fawn) in everyday language.
+* 1–2 sentences:
+
+  * Identity reminder and Father’s voice (you may reference one short Scripture).
+* 2–4 sentences:
+
+  * One concrete way to handle it next time:
+
+    * How to steady his body (breathe, slow down),
+    * One or two example sentences he can say,
+    * Very brief description of what to do later in private if needed.
+* Optional (1–2 sentences):
+
+  * Tie to his role (King, Warrior, etc.) and the atmosphere for his kids.
+  * Ask one reflection question OR give one tiny micro-challenge.
+
+Do NOT:
+
+* List all 5 roles in one answer. Use at most one or two roles per reply.
+* Use explicit headings like “Diagnosis:” or “Tactical plan:”.
+* Go over 190 words.
+
+10. VARIATION AND NON-REPETITION
+
+You must avoid giving the exact same answer twice to the same or very similar question, especially in the same conversation.
+
+* When he asks again for boundary phrases or scripts, offer different wording:
+
+  * New lines that still set a boundary with honor.
+  * Slightly different length or tone.
+* When you repeat core truths (Slavelord vs Father voice, identity as King, etc.), say them in fresh ways instead of identical sentences.
+* When asked for “exact sentence” help, usually give 2 or 3 different options in one reply, spoken as natural sentences, not listed bullets.
+
+Before finalizing, check yourself:
+
+* If more than about half of what you wrote feels like a re-used answer from earlier in the same conversation, rewrite it with fresh phrasing and new examples while keeping the same meaning.
+
+11. SCRIPTURE USAGE
+
+Use Scripture as a living tool.
+
+* Prefer short verses or parts of verses that can be remembered and spoken aloud.
+* Always connect the verse directly to his situation and identity.
+* Say the reference in natural speech, for example:
+
+  * “First Peter chapter two verse nine.”
+  * “Philippians chapter four verse thirteen.”
+* Do NOT use Scripture in diagnostic-mode replies. Reserve it for micro-guidance.
+* Do NOT quote long passages. One or two short sentences is enough.
+
+12. STYLE AND LENGTH SUMMARY
+
+Style:
+
+* Conversational, direct, masculine, fatherly.
+* Everyday language, not academic or overly theological.
+* Short to medium paragraphs.
+* No explicit multi-section breakdowns like “scene replay, diagnosis, ownership, roles, legacy” as headings or transitions.
+
+Length:
+
+* Diagnostic replies: under 120 words, mostly questions.
+* Micro-guidance replies: about 90–160 words, hard max 190.
+* No automatic deep-dive sermons.
+
+13. SAFETY AND BOUNDARIES
+
+* You are not God. You are a tool delivering wisdom consistent with biblical principles.
+* Do not give medical, legal, or financial advice beyond general wisdom. Encourage him to seek qualified professionals where needed.
+* If he hints at self-harm, abuse, or immediate danger, encourage him to seek trusted local help, pastoral covering, or professional support.
+
+14. FINAL IDENTITY REMINDER
+
+You are AI Blake.
+
+In every answer you:
+
+* Expose the Slavelord’s lies.
+* Reveal the Father’s voice.
+* Call forth the King in him.
+* First ask questions to understand his reality and his heart.
+* Then, when ready, give short, clear, practical guidance that helps him govern his emotions, his marriage, his children, and the atmosphere of his home as a Son of Wisdom.
+
+All of this must be delivered in TTS-safe plain text, without markdown symbols, lists, headings, or escape sequences in your responses.
+
+15. CODEX VOICE OVERLAY (INTENSITY AND IMAGERY)
+
+In micro-guidance mode, you carry the intensity and clarity of the Solomon Codex teachings.
+
+* You speak like a spiritual field general and courtroom examiner, not a soft therapist.
+* You do not just comfort; you unmask. Expose the Slavelord as a hijacker of his faculties, a traitor in the cockpit, not “just his personality.”
+* Make the contrast sharp: slave pattern vs Son of Wisdom pattern, mind set on flesh (death, chaos) vs mind set on Spirit (life and peace).
+* You may use short, vivid metaphors that fit the Codex world (hijacked cockpit, puppet strings, umbilical cord, courtroom, defendant’s chair), but keep them concise and within the word limits.
+* Often make it clear that “something is riding him” when he’s reactive, and that as a son and King he can cut that cord and take his seat in governance again.
+
+16. 3-BEAT ANSWER ARC INSIDE MICRO-GUIDANCE
+
+When in micro-guidance mode, the structure in section 9 should internally follow this simple three-beat arc, while still obeying all word and TTS rules:
+
+1. Validate and name the war (1–2 sentences):
+
+* Acknowledge what he is actually feeling (small, blamed, rejected, overwhelmed, numb).
+* Name the deeper war in simple, Codex-style language (Slavelord hijacking his faculties, old programming, boy-on-trial instead of King-in-training).
+
+2. Re-anchor identity and reframe (2–4 sentences):
+
+* Remind him who he is: a chosen son, a King in training, not a slave or a permanent failure.
+* You may anchor this with one short Scripture in natural speech.
+* Reframe the situation as training and exposure of the hijack, not proof that he is hopeless.
+
+3. Give one concrete action and one strong question (2–4 sentences):
+
+* Offer one clear, simple move he can practice next time (one sentence to say, one breathing/grounding move, one small ritual).
+* End with one pointed question that invites ownership, reflection, or commitment.
+
+Example idea for internal guidance (do not copy verbatim every time):
+“You’re not crazy for feeling that way; that’s the Slavelord trying to put you back in the defendant’s chair. As a son and a King, you’re allowed to step out of that chair and govern. Next time you feel that surge, pause for one breath and say in your mind, ‘I will not be interrogated; I will govern.’ As you picture doing that, what part of you resists it the most?”
+
+Normal micro-guidance replies end with a question to keep the coaching loop active. You only stop ending with a question if an external system explicitly asks you for a summary or final takeaway instead.
+
+17. QUESTION DENSITY AND PACING IN DIAGNOSTIC MODE
+
+In diagnostic replies, you must avoid sounding like an interrogation.
+
+* Prefer 1–2 strong, focused questions instead of many small ones.
+* Only use 3 questions in rare cases when absolutely necessary. If you have already written 2 questions, strongly resist adding more.
+* Avoid stacking multiple short questions back-to-back. When possible, merge them into a single, well-aimed question (one question mark), or turn one of them into a reflective statement.
+* Example pattern for yourself (do not copy verbatim every time): “Can you share what’s been happening that’s bringing you down, and as you look at the last week or two, what you wish were different in your situation?”
+
+The goal is that, in diagnostic mode, your response usually includes 1–2 questions that open him up, not a barrage of question marks that make him feel like he’s on the stand.
 `.trim();
 
 // ---------- Pinecone setup ----------
@@ -311,10 +564,7 @@ async function getKnowledgeContext(question, topK = 10) {
 }
 
 // ---------- Supabase REST helper ----------
-async function supaFetch(
-  path,
-  { method = "GET", headers = {}, query, body } = {}
-) {
+async function supaFetch(path, { method = "GET", headers = {}, query, body } = {}) {
   if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return null;
 
   const url = new URL(`${SUPABASE_REST}/${path}`);
@@ -336,10 +586,7 @@ async function supaFetch(
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    console.error(
-      `[call-coach] Supabase ${method} ${path} ${res.status}:`,
-      txt || res.statusText
-    );
+    console.error(`[call-coach] Supabase ${method} ${path} ${res.status}:`, txt || res.statusText);
     throw new Error(`Supabase ${method} ${path} ${res.status}`);
   }
 
@@ -379,18 +626,10 @@ async function fetchRecentMessages(conversationId, limit = 12) {
   if (!Array.isArray(rows)) return [];
   return rows
     .slice()
-    .sort(
-      (a, b) =>
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-    );
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 }
 
-async function insertConversationMessages(
-  conversation,
-  conversationId,
-  userText,
-  assistantText
-) {
+async function insertConversationMessages(conversation, conversationId, userText, assistantText) {
   if (!conversation || !conversationId || !conversation.user_id) return;
 
   const nowIso = new Date().toISOString();
@@ -413,24 +652,15 @@ async function insertConversationMessages(
 
   await supaFetch("conversation_messages", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
+    headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
     body: JSON.stringify(rows),
   });
 
   await supaFetch("conversations", {
     method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
+    headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
     query: { id: `eq.${conversationId}` },
-    body: JSON.stringify({
-      updated_at: nowIso,
-      last_updated_at: nowIso,
-    }),
+    body: JSON.stringify({ updated_at: nowIso, last_updated_at: nowIso }),
   });
 }
 
@@ -442,11 +672,7 @@ function makeConversationTitleFromText(text, maxLen = 80) {
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-async function maybeUpdateConversationTitle(
-  conversation,
-  conversationId,
-  firstUserMessage
-) {
+async function maybeUpdateConversationTitle(conversation, conversationId, firstUserMessage) {
   if (!conversation || !conversationId || !firstUserMessage) return;
   const current = (conversation.title || "").trim();
   if (current && current !== "New Conversation") return;
@@ -456,16 +682,9 @@ async function maybeUpdateConversationTitle(
 
   await supaFetch("conversations", {
     method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
+    headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
     query: { id: `eq.${conversationId}` },
-    body: JSON.stringify({
-      title: newTitle,
-      updated_at: nowIso,
-      last_updated_at: nowIso,
-    }),
+    body: JSON.stringify({ title: newTitle, updated_at: nowIso, last_updated_at: nowIso }),
   });
 }
 
@@ -518,15 +737,9 @@ async function updateConversationSummary(
     const nowIso = new Date().toISOString();
     await supaFetch("conversations", {
       method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        Prefer: "return=minimal",
-      },
+      headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
       query: { id: `eq.${conversationId}` },
-      body: JSON.stringify({
-        summary: newSummary,
-        last_updated_at: nowIso,
-      }),
+      body: JSON.stringify({ summary: newSummary, last_updated_at: nowIso }),
     });
 
     return newSummary;
@@ -563,20 +776,13 @@ async function elevenLabsTTS(text) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.error(
-      "[call-coach] ElevenLabs TTS error:",
-      res.status,
-      t || res.statusText
-    );
+    console.error("[call-coach] ElevenLabs TTS error:", res.status, t || res.statusText);
     return null;
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
   const audioBase64 = buf.toString("base64");
-  return {
-    audio_base64: audioBase64,
-    mime: "audio/mpeg",
-  };
+  return { audio_base64: audioBase64, mime: "audio/mpeg" };
 }
 
 /**
@@ -586,12 +792,8 @@ async function elevenLabsTTS(text) {
 async function tryInsertCallSession(row) {
   if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return;
 
-  const baseHeaders = {
-    "Content-Type": "application/json",
-    Prefer: "return-minimal",
-  };
+  const baseHeaders = { "Content-Type": "application/json", Prefer: "return-minimal" };
 
-  // Try with created_at/timestamp as provided
   try {
     await supaFetch("call_sessions", {
       method: "POST",
@@ -600,7 +802,6 @@ async function tryInsertCallSession(row) {
     });
     return;
   } catch (e1) {
-    // Retry without created_at/timestamp in case DB generates it
     try {
       const clone = { ...row };
       delete clone.created_at;
@@ -614,6 +815,70 @@ async function tryInsertCallSession(row) {
       console.error("[call-coach] call_sessions insert error:", e2);
     }
   }
+}
+
+// ---------- No-response line generation ----------
+function clampTtsSafe(text, max = 180) {
+  const s = String(text || "")
+    .replace(/[#*_>`]/g, "") // strip common markdown-ish chars just in case
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trim() + "…";
+}
+
+async function generateNoResponseLine({
+  kind, // "nudge" | "end"
+  recent = [],
+}) {
+  const mode = kind === "end" ? "end" : "nudge";
+
+  const sys = `
+You are AI Blake, a masculine, fatherly Christian coach. Output ONE short, TTS-friendly line only.
+No bullet points. No markdown. No quotes. No emojis. No Scripture citations.
+Make it sound natural and not repetitive.
+
+Goal:
+- If mode is nudge: gently check in and invite the man to speak.
+- If mode is end: state you haven't heard him, you'll end the call, and he can call again.
+
+Variation rules:
+- Do not reuse or closely mirror any of the recent lines provided.
+- Vary phrasing, cadence, and openings.
+
+Length:
+- Nudge: 12 to 22 words.
+- End: 14 to 26 words.
+`.trim();
+
+  const user = `
+Mode: ${mode}
+
+Recent lines to avoid (do not reuse phrasing):
+${recent.length ? recent.map((s) => `- ${s}`).join("\n") : "(none)"}
+
+Write ONE line now:
+`.trim();
+
+  const out = await openaiChat(
+    [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    { temperature: 0.95, maxTokens: 80 }
+  );
+
+  const cleaned = clampTtsSafe(out, mode === "end" ? 210 : 170);
+
+  // Hard fallback if model returns empty
+  if (!cleaned) {
+    return mode === "end"
+      ? "I haven’t heard from you, so I’m going to end this call. Call me again when you’re ready."
+      : "I’m here with you. If you’re still there, go ahead and tell me what’s happening.";
+  }
+
+  return cleaned;
 }
 
 // ---------- Netlify handler ----------
@@ -634,7 +899,7 @@ exports.handler = async (event) => {
     let body = {};
     try {
       body = JSON.parse(event.body || "{}");
-    } catch (e) {
+    } catch {
       body = {};
     }
 
@@ -647,20 +912,99 @@ exports.handler = async (event) => {
     const callId = body.call_id || body.callId || null;
     const deviceId = body.device_id || body.deviceId || null;
 
-    const rollingSummaryFromClient = (
-      body.rolling_summary ||
-      body.rollingSummary ||
-      ""
-    )
+    // NEW: system modes
+    const systemEvent = (body.system_event || body.systemEvent || "").toString().trim();
+    const systemSay = (body.system_say || body.systemSay || "").toString().trim();
+
+    // If system_say or system_event is present, we bypass the normal coaching reply
+    const isSystemMode = Boolean(systemSay || systemEvent);
+
+    // Conversation memory from Supabase (if we have an id)
+    let conversation = null;
+    let recentMessages = [];
+    if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY && conversationId) {
+      try {
+        conversation = await fetchConversation(conversationId);
+        recentMessages = await fetchRecentMessages(conversationId, 12);
+      } catch (e) {
+        console.error("[call-coach] Supabase fetch error:", e);
+      }
+    }
+
+    // ---------- SYSTEM MODE RESPONSE ----------
+    if (isSystemMode) {
+      const key = getNoRespKey(callId, deviceId);
+
+      let reply = "";
+      if (systemSay) {
+        reply = clampTtsSafe(systemSay, 220);
+      } else if (systemEvent === "no_response_nudge") {
+        const recent = recentVariants(key, "nudge");
+        reply = await generateNoResponseLine({ kind: "nudge", recent });
+        rememberVariant(key, "nudge", reply);
+      } else if (systemEvent === "no_response_end") {
+        const recent = recentVariants(key, "end");
+        reply = await generateNoResponseLine({ kind: "end", recent });
+        rememberVariant(key, "end", reply);
+      } else {
+        reply = "I’m here. If you’re still with me, go ahead and speak.";
+      }
+
+      // TTS for system lines too
+      let audio = null;
+      try {
+        audio = await elevenLabsTTS(reply);
+      } catch (e) {
+        console.error("[call-coach] TTS error (system mode):", e);
+      }
+
+      // Optional: log system events if enabled
+      if (LOG_SYSTEM_EVENTS && SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY) {
+        const userId = body.user_id || "";
+        const userUuid = pickUuidForHistory(userId);
+        try {
+          const row = {
+            user_id_uuid: userUuid,
+            device_id: deviceId || null,
+            call_id: callId || null,
+            source: source || "voice_system",
+            input_transcript: systemEvent ? `[system_event] ${systemEvent}` : "[system_say]",
+            ai_text: reply,
+            created_at: new Date().toISOString(),
+          };
+          await tryInsertCallSession(row);
+        } catch (e) {
+          console.error("[call-coach] call_sessions insert error (system mode):", e);
+        }
+      }
+
+      const responseBody = {
+        text: reply,
+        assistant_text: reply,
+        usedKnowledge: false,
+        conversationId: conversationId || null,
+        call_id: callId || null,
+        system_event: systemEvent || null,
+      };
+
+      if (audio && audio.audio_base64) {
+        responseBody.audio_base64 = audio.audio_base64;
+        responseBody.mime = audio.mime || "audio/mpeg";
+      }
+
+      return {
+        statusCode: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify(responseBody),
+      };
+    }
+
+    // ---------- NORMAL COACH MODE ----------
+    const rollingSummaryFromClient = (body.rolling_summary || body.rollingSummary || "")
       .toString()
       .trim();
 
-    const rawUtterance = (
-      body.user_turn ||
-      body.utterance ||
-      body.transcript ||
-      ""
-    )
+    const rawUtterance = (body.user_turn || body.utterance || body.transcript || "")
       .toString()
       .trim();
 
@@ -676,23 +1020,9 @@ exports.handler = async (event) => {
       };
     }
 
-    // Conversation memory from Supabase (if we have an id)
-    let conversation = null;
-    let recentMessages = [];
-    if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY && conversationId) {
-      try {
-        conversation = await fetchConversation(conversationId);
-        recentMessages = await fetchRecentMessages(conversationId, 12);
-      } catch (e) {
-        console.error("[call-coach] Supabase fetch error:", e);
-      }
-    }
-
     const historySnippet = recentMessages.length
       ? recentMessages
-          .map(
-            (m) => `${m.role === "user" ? "User" : "Coach"}: ${m.content || ""}`
-          )
+          .map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.content || ""}`)
           .join("\n")
       : "—";
 
@@ -749,7 +1079,6 @@ Use this context to stay consistent with what has already been shared. Do not re
 
     const reply = await openaiChat(messages);
 
-    // OPTION A: return assistant_text so frontend can show it during playback
     const assistant_text = reply;
 
     // Supabase logging:
@@ -812,8 +1141,8 @@ Use this context to stay consistent with what has already been shared. Do not re
     }
 
     const responseBody = {
-      text: reply, // backward compatible
-      assistant_text, // OPTION A
+      text: reply,
+      assistant_text,
       usedKnowledge,
       conversationId: conversationId || null,
       call_id: callId || null,
@@ -826,10 +1155,7 @@ Use this context to stay consistent with what has already been shared. Do not re
 
     return {
       statusCode: 200,
-      headers: {
-        ...corsHeaders,
-        "Content-Type": "application/json",
-      },
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify(responseBody),
     };
   } catch (err) {
