@@ -1,15 +1,12 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// Voice call + inline transcript + Deepgram streaming (always-on for mobile) + on-screen Debug HUD
+// Voice call + inline transcript
 //
-// NOTES:
-// - Desktop: uses Web Speech API if available (live captions).
-// - Mobile (Android/iOS): Deepgram WS streaming is ALWAYS-ON for the whole call (live captions).
-// - The spoken user audio is still recorded via MediaRecorder and sent to call-coach.
-// - Debug HUD appears on the UI (no console needed) and shows DG status/errors.
+// ✅ Desktop: Web Speech API (live captions) - unchanged
+// ✅ Mobile: OpenAI Whisper (whisper-1) via Netlify function (turn-based, after MediaRecorder stops)
 //
 // Requires:
-// - Netlify function: /.netlify/functions/deepgram-token  (returns {access_token})
+// - Netlify function: /.netlify/functions/openai-transcribe  (returns { text })
 // - Netlify function: /.netlify/functions/call-coach
 // - Netlify function: /.netlify/functions/call-greeting
 
@@ -55,7 +52,9 @@ const N8N_TRANSCRIBE_URL = "";
 
 const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 const GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
-const DEEPGRAM_TOKEN_ENDPOINT = "/.netlify/functions/deepgram-token";
+
+// ✅ OpenAI Whisper transcription (mobile)
+const OPENAI_TRANSCRIBE_ENDPOINT = "/.netlify/functions/openai-transcribe";
 
 /* ---------- I/O settings ---------- */
 const ENABLE_MEDIARECORDER_64KBPS = true;
@@ -63,12 +62,6 @@ const TIMESLICE_MS = 100;
 
 const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "");
 const ENABLE_STREAMED_PLAYBACK = !IS_MOBILE;
-
-/**
- * ✅ Deepgram runs on mobile browsers.
- * (Always-on for whole call; not per VAD segment)
- */
-const USE_DEEPGRAM_ON_MOBILE = IS_MOBILE;
 
 /* ---------- USER / DEVICE ---------- */
 const USER_ID_KEY = "sow_user_id";
@@ -142,7 +135,7 @@ let isPlayingAI = false;
 let callStartedAt = null;
 let callTimerInterval = null;
 
-let globalStream = null; // ✅ reused for whole call on mobile
+let globalStream = null; // reused for whole call
 let mediaRecorder = null;
 let recordChunks = [];
 
@@ -209,44 +202,31 @@ function renderDebugHud() {
 
   const lines = [
     `Mobile: ${IS_MOBILE}`,
-    `DG enabled: ${DG.enable}`,
-    `DG status: ${window.__SOW_DG_STATUS || "(not started)"}`,
-    `WS state: ${window.__SOW_DG_WS_STATE ?? ""}`,
-    `Token OK: ${window.__SOW_DG_TOKEN_OK ?? ""}`,
-    `Last msg: ${window.__SOW_DG_LASTMSG || ""}`,
-    `Last err: ${window.__SOW_DG_ERR || ""}`,
+    `Transcriber: ${IS_MOBILE ? "OpenAI whisper-1" : "Web Speech API"}`,
+    `WSR status: ${window.__SOW_WSR_STATUS || ""}`,
+    `Last msg: ${window.__SOW_LASTMSG || ""}`,
+    `Last err: ${window.__SOW_LASTERR || ""}`,
   ].filter(Boolean);
 
   el.textContent = lines.join("\n");
 }
 
-function dgHudStatus(s) {
-  window.__SOW_DG_STATUS = String(s || "");
+function hudStatus(s) {
+  window.__SOW_WSR_STATUS = String(s || "");
   renderDebugHud();
 }
-function dgHudErr(e) {
-  window.__SOW_DG_ERR = String(e || "");
+function hudErr(e) {
+  window.__SOW_LASTERR = String(e || "");
   renderDebugHud();
 }
-function dgHudMsg(m) {
-  window.__SOW_DG_LASTMSG = String(m || "");
-  renderDebugHud();
-}
-function dgHudWsState(v) {
-  window.__SOW_DG_WS_STATE = v;
-  renderDebugHud();
-}
-function dgHudToken(ok) {
-  window.__SOW_DG_TOKEN_OK = ok ? "yes" : "no";
+function hudMsg(m) {
+  window.__SOW_LASTMSG = String(m || "");
   renderDebugHud();
 }
 
 function nowHHMM() {
   try {
-    return new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   } catch {
     return "";
   }
@@ -277,9 +257,7 @@ function setAutoScroll(on) {
 
 function ensureTranscriptElementsExist() {
   if (!transcriptListEl || !transcriptInterimEl) {
-    warn(
-      "Transcript elements not found. Check call.html ids: transcriptList/transcriptInterim."
-    );
+    warn("Transcript elements not found. Check call.html ids: transcriptList/transcriptInterim.");
   }
 }
 
@@ -344,10 +322,7 @@ function armIdleAfterAI() {
   cancelIdleTimers();
   idleArmed = true;
   idleStep = 0;
-  idleTimer1 = setTimeout(
-    () => maybeRunNoResponseNudge(),
-    NO_RESPONSE.FIRST_NUDGE_MS
-  );
+  idleTimer1 = setTimeout(() => maybeRunNoResponseNudge(), NO_RESPONSE.FIRST_NUDGE_MS);
 }
 
 function disarmIdle(reason = "") {
@@ -373,13 +348,10 @@ async function callCoachSystemEvent(eventType) {
 
   if (!currentCallId) {
     try {
-      currentCallId =
-        localStorage.getItem("last_call_id") || crypto.randomUUID();
+      currentCallId = localStorage.getItem("last_call_id") || crypto.randomUUID();
       localStorage.setItem("last_call_id", currentCallId);
     } catch {
-      currentCallId =
-        currentCallId ||
-        `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      currentCallId = currentCallId || `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     }
   }
 
@@ -398,9 +370,7 @@ async function callCoachSystemEvent(eventType) {
 
   if (!resp.ok) {
     const t = await resp.text().catch(() => "");
-    throw new Error(
-      `call-coach system_event ${resp.status}: ${t || resp.statusText}`
-    );
+    throw new Error(`call-coach system_event ${resp.status}: ${t || resp.statusText}`);
   }
 
   const data = await resp.json().catch(() => ({}));
@@ -508,9 +478,7 @@ function updateCallTimer() {
   const elapsedSec = Math.floor((Date.now() - callStartedAt) / 1000);
   const mins = Math.floor(elapsedSec / 60);
   const secs = elapsedSec % 60;
-  callTimerEl.textContent = `${String(mins).padStart(2, "0")}:${String(
-    secs
-  ).padStart(2, "0")}`;
+  callTimerEl.textContent = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
 function startCallTimer() {
@@ -618,7 +586,7 @@ async function fetchRollingSummary(user_id, device) {
     const rows = await resp.json();
     return rows?.[0]?.summary || "";
   } catch (e) {
-    warn("fetchRollingSummary failed", e);
+    warn("fetchRollingSummary failed:", e);
     return "";
   }
 }
@@ -947,251 +915,6 @@ function stopMicVAD() {
   vadCtx = vadAnalyser = vadSource = null;
 }
 
-/* ---------- Deepgram (always-on for mobile) ---------- */
-const DG = {
-  enable: USE_DEEPGRAM_ON_MOBILE,
-  endpoint: "wss://api.deepgram.com/v1/listen",
-  model: "nova-3",
-  language: "en-US",
-  smart_format: true,
-  punctuate: true,
-  interim_results: true,
-  endpointing: 50,
-  sample_rate: 16000,
-};
-
-let dgSocket = null;
-let dgCtx = null;
-let dgSource = null;
-let dgProcessor = null;
-let dgInputSampleRate = 48000;
-let dgInterim = "";
-
-function downsampleTo16k(float32, inSampleRate, outSampleRate = 16000) {
-  if (outSampleRate === inSampleRate) return float32;
-
-  const ratio = inSampleRate / outSampleRate;
-  const newLen = Math.round(float32.length / ratio);
-  const result = new Float32Array(newLen);
-
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-    let accum = 0;
-    let count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32.length; i++) {
-      accum += float32[i];
-      count++;
-    }
-    result[offsetResult] = count ? accum / count : 0;
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-  return result;
-}
-
-function floatTo16BitPCM(float32) {
-  const buffer = new ArrayBuffer(float32.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32.length; i++, offset += 2) {
-    let s = Math.max(-1, Math.min(1, float32[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return buffer;
-}
-
-async function fetchDeepgramToken() {
-  dgHudStatus("token: fetching");
-  const resp = await fetch(`${DEEPGRAM_TOKEN_ENDPOINT}?ttl=120`, { method: "GET" });
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    dgHudToken(false);
-    throw new Error(`Deepgram token HTTP ${resp.status}: ${t || resp.statusText}`);
-  }
-  const data = await resp.json().catch(() => ({}));
-  if (!data.access_token) {
-    dgHudToken(false);
-    throw new Error("Deepgram token missing access_token");
-  }
-  dgHudToken(true);
-  dgHudStatus("token: ok");
-  return data.access_token;
-}
-
-/**
- * ✅ IMPORTANT:
- * - Do NOT pass token in the query string.
- * - Authenticate browser WS using Sec-WebSocket-Protocol:
- *     new WebSocket(url, ["token", access_token])
- */
-function buildDeepgramWsUrl() {
-  const u = new URL(DG.endpoint);
-  u.searchParams.set("model", DG.model);
-  u.searchParams.set("language", DG.language);
-  u.searchParams.set("smart_format", String(!!DG.smart_format));
-  u.searchParams.set("punctuate", String(!!DG.punctuate));
-  u.searchParams.set("interim_results", String(!!DG.interim_results));
-  u.searchParams.set("endpointing", String(DG.endpointing));
-  u.searchParams.set("encoding", "linear16");
-  u.searchParams.set("sample_rate", String(DG.sample_rate));
-  u.searchParams.set("channels", "1");
-  return u.toString();
-}
-
-function createDeepgramWebSocket(wsUrl, accessToken) {
-  // ✅ Correct: pass subprotocols as an ARRAY (fixes “subprotocol is invalid”)
-  const ws = new WebSocket(wsUrl, ["token", accessToken]);
-
-  // REQUIRED for Safari binary audio
-  ws.binaryType = "arraybuffer";
-
-  return ws;
-}
-
-function stopDeepgramRecognizer() {
-  try {
-    if (dgProcessor) dgProcessor.onaudioprocess = null;
-  } catch {}
-  try {
-    dgProcessor?.disconnect();
-  } catch {}
-  try {
-    dgSource?.disconnect();
-  } catch {}
-  dgProcessor = dgSource = null;
-
-  if (dgCtx && dgCtx.state !== "closed") {
-    try {
-      dgCtx.close();
-    } catch {}
-  }
-  dgCtx = null;
-
-  if (dgSocket) {
-    try {
-      dgSocket.close();
-    } catch {}
-  }
-  dgSocket = null;
-  dgInterim = "";
-  dgHudStatus("stopped");
-  dgHudWsState("");
-}
-
-async function startDeepgramRecognizer(stream) {
-  if (!DG.enable) return false;
-
-  // if already running, keep it
-  if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
-    dgHudStatus("streaming (already)");
-    return true;
-  }
-
-  stopDeepgramRecognizer();
-  dgHudStatus("starting");
-
-  let token = "";
-  try {
-    token = await fetchDeepgramToken();
-  } catch (e) {
-    warn("Deepgram token fetch failed:", e);
-    dgHudErr(`token: ${String(e?.message || e)}`);
-    dgHudStatus("token failed");
-    return false;
-  }
-
-  const wsUrl = buildDeepgramWsUrl();
-  dgHudStatus("ws: connecting");
-
-  let socket;
-  try {
-    socket = createDeepgramWebSocket(wsUrl, token);
-  } catch (e) {
-    warn("Deepgram WebSocket create failed:", e);
-    dgHudErr(`ws create: ${String(e?.message || e)}`);
-    dgHudStatus("ws create failed");
-    return false;
-  }
-
-  dgSocket = socket;
-
-  socket.onopen = () => {
-    log("[SOW] Deepgram WS open");
-    dgHudStatus("ws: open");
-    dgHudWsState(socket.readyState);
-  };
-
-  socket.onerror = (e) => {
-    warn("[SOW] Deepgram WS error", e);
-    dgHudErr("ws error");
-    dgHudStatus("ws error");
-    dgHudWsState(socket.readyState);
-  };
-
-  socket.onclose = (evt) => {
-    log("[SOW] Deepgram WS closed", evt?.code, evt?.reason || "");
-    dgHudStatus(`ws closed: ${evt?.code || ""} ${evt?.reason || ""}`.trim());
-    dgHudWsState(socket.readyState);
-  };
-
-  socket.onmessage = (evt) => {
-    try {
-      dgHudWsState(socket.readyState);
-
-      const msg = JSON.parse(evt.data);
-      const alt = msg?.channel?.alternatives?.[0];
-      const transcript = (alt?.transcript || "").trim();
-      const isFinal = !!msg?.is_final;
-
-      if (!transcript) {
-        if (isFinal) transcriptUI.setInterim("");
-        return;
-      }
-
-      dgHudMsg(`${isFinal ? "final" : "interim"}: ${transcript.slice(0, 80)}`);
-
-      if (isFinal) {
-        transcriptUI.addFinalLine(transcript);
-        dgInterim = "";
-      } else {
-        dgInterim = transcript;
-        transcriptUI.setInterim(dgInterim);
-      }
-    } catch {
-      // ignore non-JSON frames
-    }
-  };
-
-  dgCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (dgCtx.state === "suspended") dgCtx.resume().catch(() => {});
-  dgInputSampleRate = dgCtx.sampleRate || 48000;
-
-  dgSource = dgCtx.createMediaStreamSource(stream);
-
-  // ScriptProcessor works on Safari (deprecated but still supported)
-  const bufferSize = 4096;
-  dgProcessor = dgCtx.createScriptProcessor(bufferSize, 1, 1);
-  dgSource.connect(dgProcessor);
-  dgProcessor.connect(dgCtx.destination);
-
-  dgProcessor.onaudioprocess = (e) => {
-    if (!dgSocket || dgSocket.readyState !== WebSocket.OPEN) return;
-    try {
-      const input = e.inputBuffer.getChannelData(0);
-      const down = downsampleTo16k(input, dgInputSampleRate, DG.sample_rate);
-      const pcm16 = floatTo16BitPCM(down);
-      dgSocket.send(pcm16);
-      noteUserActivity();
-    } catch {}
-  };
-
-  dgHudStatus("streaming");
-  return true;
-}
-
 /* ---------- Mic stream: get once per call (mobile reliability) ---------- */
 async function ensureMicStream() {
   if (globalStream) return globalStream;
@@ -1320,6 +1043,31 @@ document.addEventListener("keydown", (e) => {
 tsClearBtn?.addEventListener("click", () => transcriptUI.clearAll());
 tsAutoScrollBtn?.addEventListener("click", () => setAutoScroll(!autoScrollOn));
 
+/* ---------- OpenAI Whisper (mobile) ---------- */
+async function transcribeWithOpenAI(blob, { model = "whisper-1", language = "en" } = {}) {
+  if (!blob || blob.size < 1000) return "";
+
+  hudStatus("transcribe: uploading");
+  hudErr("");
+  hudMsg("");
+
+  const fd = new FormData();
+  fd.append("file", blob, "audio.webm");
+  fd.append("model", model);
+  fd.append("language", language);
+
+  const resp = await fetch(OPENAI_TRANSCRIBE_ENDPOINT, { method: "POST", body: fd });
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`openai-transcribe ${resp.status}: ${t || resp.statusText}`);
+  }
+  const data = await resp.json().catch(() => ({}));
+  const text = (data.text || "").toString().trim();
+  hudStatus(text ? "transcribe: ok" : "transcribe: empty");
+  hudMsg(text ? `final: ${text.slice(0, 80)}` : "");
+  return text;
+}
+
 /* ---------- Greeting (ALWAYS transcribable) ---------- */
 async function fetchGreetingJSON() {
   const user_id = getUserIdForWebhook();
@@ -1399,11 +1147,9 @@ async function startCall() {
   disarmIdle("startCall");
   noteUserActivity();
 
-  dgHudStatus("call starting");
-  dgHudErr("");
-  dgHudMsg("");
-  dgHudWsState("");
-  dgHudToken(false);
+  hudStatus("call starting");
+  hudErr("");
+  hudMsg("");
 
   try {
     currentCallId = crypto.randomUUID();
@@ -1448,19 +1194,10 @@ async function startCall() {
     greetingPayload = null;
     prepareGreetingForNextCall();
 
-    // ✅ Get mic stream ONCE for the call, then start Deepgram once (mobile)
+    // ✅ Get mic stream ONCE for the call
     statusText.textContent = "Connecting mic…";
-    const stream = await ensureMicStream();
-
+    await ensureMicStream();
     if (!isCalling) return;
-
-    if (DG.enable) {
-      statusText.textContent = "Starting live transcription…";
-      const ok = await startDeepgramRecognizer(stream);
-      if (!ok) {
-        statusText.textContent = "Live transcription failed. Still recording audio…";
-      }
-    }
 
     // begin VAD capture loop
     await startRecordingLoop();
@@ -1486,9 +1223,6 @@ function endCall() {
   stopMicVAD();
   stopRing();
   stopBargeInMonitor();
-
-  // ✅ stop Deepgram only here
-  stopDeepgramRecognizer();
 
   try {
     globalStream?.getTracks().forEach((t) => t.stop());
@@ -1518,7 +1252,7 @@ function endCall() {
     greetingAudioUrl = null;
   }
 
-  dgHudStatus("call ended");
+  hudStatus("call ended");
 }
 
 /* Small one-shot clips (ring/greeting/etc) */
@@ -1585,8 +1319,8 @@ function commitInterimToFinal() {
 }
 
 function openNativeRecognizer() {
-  // ✅ If Deepgram is enabled (mobile), do NOT run Web Speech
-  if (DG.enable) return;
+  // ✅ Desktop only (you said it works wonderfully there)
+  if (IS_MOBILE) return;
 
   const ASR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!ASR) {
@@ -1704,7 +1438,7 @@ async function captureOneTurn() {
       stopRing();
       transcriptUI.setInterim("");
 
-      // ✅ DO NOT stop Deepgram here (always-on for mobile)
+      // stop desktop recognizer per-turn
       closeNativeRecognizer();
 
       HumeRealtime.stopTurn?.();
@@ -1712,8 +1446,8 @@ async function captureOneTurn() {
 
     startMicVAD(stream, "#d4a373");
 
-    // Start captions engine
-    openNativeRecognizer(); // desktop only
+    // Start captions engine (desktop only)
+    openNativeRecognizer();
 
     HumeRealtime.startTurn?.(stream, vadCtx);
     mediaRecorder.start(TIMESLICE_MS);
@@ -1739,10 +1473,27 @@ async function captureOneTurn() {
 async function uploadRecordingAndNotify() {
   if (!recordChunks?.length) return false;
 
-  const transcript = finalSegments.join(" ").replace(/\s+/g, " ").trim();
+  // Desktop may already have Web Speech segments
+  let transcript = finalSegments.join(" ").replace(/\s+/g, " ").trim();
 
-  // ✅ IMPORTANT: don’t hard-fail the entire call if transcript is empty
-  // (prevents call-coach 400 Missing transcript loops on mobile)
+  const mime = mediaRecorder?.mimeType || "audio/webm";
+  const blob = new Blob(recordChunks, { type: mime });
+  recordChunks = [];
+
+  // ✅ Mobile: use OpenAI Whisper if Web Speech produced nothing
+  if (IS_MOBILE && !transcript) {
+    statusText.textContent = "Transcribing…";
+    try {
+      transcript = await transcribeWithOpenAI(blob, { model: "whisper-1", language: "en" });
+      if (transcript) transcriptUI.addFinalLine(transcript);
+    } catch (e) {
+      warn("OpenAI transcription failed", e);
+      hudErr(`transcribe error: ${String(e?.message || e)}`);
+      hudStatus("transcribe failed");
+    }
+  }
+
+  // ✅ Don’t hard-fail the entire call if transcript is empty
   if (!transcript) {
     statusText.textContent = "I didn’t catch that — try again.";
     return false;
@@ -1750,10 +1501,6 @@ async function uploadRecordingAndNotify() {
 
   maybeUpdateConversationTitleFromTranscript(transcript).catch(() => {});
   noteUserActivity();
-
-  const mime = mediaRecorder?.mimeType || "audio/webm";
-  const blob = new Blob(recordChunks, { type: mime });
-  recordChunks = [];
 
   let audioUrl = "";
   const user_id = getUserIdForWebhook();
@@ -1770,7 +1517,9 @@ async function uploadRecordingAndNotify() {
         });
 
       if (!error && data?.path) {
-        const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(data.path);
+        const { data: pub } = supabase.storage
+          .from(SUPABASE_BUCKET)
+          .getPublicUrl(data.path);
         audioUrl = pub?.publicUrl || "";
       }
     } catch (e) {
@@ -2006,7 +1755,8 @@ async function sendChatToN8N(message) {
     }
 
     const data = await resp.json().catch(() => ({}));
-    const reply = (data.reply || data.text || data.output || "").toString().trim() || "…";
+    const reply =
+      (data.reply || data.text || data.output || "").toString().trim() || "…";
 
     if (typingBubble) {
       typingBubble.parentElement?.classList.remove("typing");
@@ -2043,14 +1793,3 @@ async function sendChatToN8N(message) {
 
   renderDebugHud();
 })();
-
-/* ---------- Optional: expose debug helpers ---------- */
-window.__SOW = {
-  DG,
-  stopDeepgramRecognizer,
-  startDeepgramRecognizer,
-  dgHudStatus,
-  dgHudErr,
-  dgHudMsg,
-  renderDebugHud,
-};
