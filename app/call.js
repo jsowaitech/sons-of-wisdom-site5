@@ -115,6 +115,11 @@ const modeBtn = document.getElementById("mode-btn");
 const threadLink =
   document.getElementById("thread-link") || document.getElementById("btn-thread");
 
+// ✅ Control labels (added)
+const callLabel = document.getElementById("call-label");
+const micLabel = document.getElementById("mic-label");
+const speakerLabel = document.getElementById("speaker-label");
+
 // ✅ Inline transcript panel (ONLY these)
 const transcriptListEl = document.getElementById("transcriptList");
 const transcriptInterimEl = document.getElementById("transcriptInterim");
@@ -351,7 +356,8 @@ async function callCoachSystemEvent(eventType) {
       currentCallId = localStorage.getItem("last_call_id") || crypto.randomUUID();
       localStorage.setItem("last_call_id", currentCallId);
     } catch {
-      currentCallId = currentCallId || `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      currentCallId =
+        currentCallId || `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     }
   }
 
@@ -478,7 +484,10 @@ function updateCallTimer() {
   const elapsedSec = Math.floor((Date.now() - callStartedAt) / 1000);
   const mins = Math.floor(elapsedSec / 60);
   const secs = elapsedSec % 60;
-  callTimerEl.textContent = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  callTimerEl.textContent = `${String(mins).padStart(2, "0")}:${String(secs).padStart(
+    2,
+    "0"
+  )}`;
 }
 
 function startCallTimer() {
@@ -970,12 +979,16 @@ function updateMicTracks() {
     });
 }
 
+// ✅ updated: also set label
 function updateSpeakerUI() {
   speakerBtn?.setAttribute("aria-pressed", String(!speakerMuted));
+  if (speakerLabel) speakerLabel.textContent = "Speaker";
 }
 
+// ✅ updated: also set label (Mute/Unmute)
 function updateMicUI() {
   micBtn?.setAttribute("aria-pressed", String(micMuted));
+  if (micLabel) micLabel.textContent = micMuted ? "Unmute" : "Mute";
 }
 
 function updateModeBtnUI() {
@@ -1147,6 +1160,10 @@ async function startCall() {
   disarmIdle("startCall");
   noteUserActivity();
 
+  // ✅ label + aria update
+  if (callLabel) callLabel.textContent = "End Call";
+  callBtn?.setAttribute("aria-label", "End call");
+
   hudStatus("call starting");
   hudErr("");
   hudMsg("");
@@ -1207,6 +1224,10 @@ async function startCall() {
     resetCallTimer();
     isCalling = false;
     callBtn.classList.remove("call-active");
+
+    // ✅ revert label + aria on failure
+    if (callLabel) callLabel.textContent = "Start Call";
+    callBtn?.setAttribute("aria-label", "Start call");
   }
 }
 
@@ -1216,6 +1237,10 @@ function endCall() {
   isPlayingAI = false;
 
   disarmIdle("endCall");
+
+  // ✅ label + aria update
+  if (callLabel) callLabel.textContent = "Start Call";
+  callBtn?.setAttribute("aria-label", "Start call");
 
   callBtn.classList.remove("call-active");
   statusText.textContent = "Call ended.";
@@ -1820,8 +1845,7 @@ async function sendChatToN8N(message) {
     }
 
     const data = await resp.json().catch(() => ({}));
-    const reply =
-      (data.reply || data.text || data.output || "").toString().trim() || "…";
+    const reply = (data.reply || data.text || data.output || "").toString().trim() || "…";
 
     if (typingBubble) {
       typingBubble.parentElement?.classList.remove("typing");
@@ -1851,9 +1875,13 @@ async function sendChatToN8N(message) {
 
   prepareGreetingForNextCall();
 
+  // ✅ initialize labels
+  if (callLabel) callLabel.textContent = "Start Call";
+  if (speakerLabel) speakerLabel.textContent = "Speaker";
+
   resetCallTimer();
-  updateMicUI();
-  updateSpeakerUI();
+  updateMicUI();      // sets Mute/Unmute label
+  updateSpeakerUI();  // sets Speaker label
   updateModeBtnUI();
 
   renderDebugHud();

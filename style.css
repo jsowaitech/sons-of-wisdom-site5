@@ -16,7 +16,7 @@ body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
   color: #f9fafb;
-  background: var(--bg-gradient);  /* ⬅️ always use the dark gradient */
+  background: var(--bg-gradient); /* ⬅️ always use the dark gradient */
 }
 
 /* Shell layout – no background here anymore */
@@ -735,6 +735,40 @@ body.chat-app .content {
 }
 
 /* =========================================================
+   CALL: labeled controls (NEW)
+   ========================================================= */
+
+.call-controls.labeled {
+  gap: 0.9rem;
+}
+
+.call-control {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 92px;
+}
+
+.call-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.95);
+  user-select: none;
+  text-align: center;
+}
+
+@media (max-width: 480px) {
+  .call-control {
+    min-width: 84px;
+  }
+  .call-label {
+    font-size: 0.7rem;
+  }
+}
+
+/* =========================================================
    HISTORY
    ========================================================= */
 
@@ -790,6 +824,144 @@ body.sow-shell main.content h2.tiny {
   border-color: var(--accent);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.8);
   transform: translateY(-1px);
+}
+
+/* =========================================================
+   HISTORY: 3-dot actions + menu (NEW)
+   ========================================================= */
+
+.conv-item {
+  position: relative;
+  padding-right: 3.1rem; /* room for kebab */
+}
+
+.conv-main {
+  width: 100%;
+}
+
+.conv-actions {
+  position: absolute;
+  top: 50%;
+  right: 0.65rem;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.conv-kebab {
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  background: rgba(15, 23, 42, 0.85);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.conv-kebab span {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(249, 250, 251, 0.9);
+  display: block;
+}
+
+.conv-kebab:hover {
+  border-color: rgba(246, 201, 121, 0.65);
+  background: rgba(15, 23, 42, 0.95);
+  transform: none;
+}
+
+.conv-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 160px;
+  padding: 0.35rem;
+  border-radius: 14px;
+  background: rgba(10, 18, 34, 0.96);
+  border: 1px solid rgba(246, 201, 121, 0.35);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(14px);
+  display: none;
+  z-index: 50;
+}
+
+.conv-actions.open .conv-menu {
+  display: block;
+}
+
+.conv-menu-item {
+  width: 100%;
+  text-align: left;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  padding: 0.55rem 0.65rem;
+  background: transparent;
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+
+.conv-menu-item:hover {
+  background: rgba(148, 163, 184, 0.14);
+  border-color: rgba(148, 163, 184, 0.3);
+}
+
+.conv-menu-item.danger {
+  color: #fecaca;
+}
+
+.conv-menu-item.danger:hover {
+  background: rgba(248, 113, 113, 0.16);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+/* =========================================================
+   HISTORY: inline rename (NEW)
+   ========================================================= */
+
+.conv-item .title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.conv-item .title-text {
+  display: inline-block;
+}
+
+.conv-item .title-edit {
+  display: none;
+  width: min(520px, 70vw);
+  max-width: 100%;
+  padding: 0.35rem 0.55rem;
+  border-radius: 10px;
+  border: 1px solid rgba(246, 201, 121, 0.55);
+  background: rgba(15, 23, 42, 0.95);
+  color: var(--text-main);
+  font-size: 0.9rem;
+  outline: none;
+}
+
+.conv-item.renaming .title-text {
+  display: none;
+}
+
+.conv-item.renaming .title-edit {
+  display: inline-block;
+}
+
+.conv-item.renaming {
+  border-color: rgba(246, 201, 121, 0.65);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.75);
+  transform: none;
 }
 
 /* =========================================================
@@ -1042,7 +1214,8 @@ body.sow-shell main.content h2.tiny {
   border: 1px solid rgba(30, 64, 175, 0.9);
   background: rgba(15, 23, 42, 0.96);
   color: var(--text-main);
-  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
   font-size: 0.8rem;
 }
 
@@ -1063,7 +1236,8 @@ body.sow-shell main.content h2.tiny {
 }
 
 .ts-footer .hint code {
-  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
   font-size: 0.73rem;
   color: var(--text-gold);
 }
@@ -1175,20 +1349,20 @@ body.ts-live.embed .auto-scroll {
   .call-side-transcript {
     margin-top: 1rem;
     height: auto;
-    min-height: 60vh;      /* 🔵 grow with viewport on mobile */
+    min-height: 60vh; /* 🔵 grow with viewport on mobile */
     max-height: none;
     padding: 0.85rem;
   }
 
   .call-side-transcript iframe {
     height: 100%;
-    min-height: 52vh;      /* 🔵 ensure inner transcript card has room */
+    min-height: 52vh; /* 🔵 ensure inner transcript card has room */
   }
 }
 
 @media (max-width: 480px) {
   .call-side-transcript {
-    min-height: 65vh;      /* a bit more space on very small phones */
+    min-height: 65vh; /* a bit more space on very small phones */
     padding: 0.8rem;
   }
 
@@ -1234,7 +1408,7 @@ body.ts-live.embed .auto-scroll {
 /* 2) Transcript bubbles: make them deterministic + full-width-friendly */
 .ts-list .turn .bubble {
   max-width: 100%;
-  margin: 0;                /* transcript spacing controlled by .turn */
+  margin: 0; /* transcript spacing controlled by .turn */
   padding: 0.6rem 0.85rem;
   border-radius: 14px;
   font-size: 0.88rem;
@@ -1249,7 +1423,7 @@ body.ts-live.embed .auto-scroll {
 
 /* 3) Make call-side transcript panel scroll correctly on mobile */
 .page-call .call-side-transcript {
-  min-height: 0;            /* critical for nested flex scrolling */
+  min-height: 0; /* critical for nested flex scrolling */
 }
 
 .page-call .call-side-transcript .transcript-wrap {

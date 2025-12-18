@@ -63,37 +63,46 @@
 
           <!-- ✅ Removed legacy transcript DOM entirely to prevent CSS conflicts -->
 
-          <!-- Call controls -->
-          <div class="call-controls">
-            <button
-              id="call-btn"
-              class="btn circle call-toggle primary"
-              type="button"
-              aria-pressed="false"
-              aria-label="Start call"
-            >
-              📞
-            </button>
+          <!-- Call controls (UPDATED: labels under buttons) -->
+          <div class="call-controls labeled">
+            <div class="call-control">
+              <button
+                id="call-btn"
+                class="btn circle call-toggle primary"
+                type="button"
+                aria-pressed="false"
+                aria-label="Start call"
+              >
+                📞
+              </button>
+              <div class="call-label" id="call-label">Start Call</div>
+            </div>
 
-            <button
-              id="mic-btn"
-              class="btn circle"
-              type="button"
-              aria-pressed="false"
-              aria-label="Toggle microphone"
-            >
-              🎙
-            </button>
+            <div class="call-control">
+              <button
+                id="mic-btn"
+                class="btn circle"
+                type="button"
+                aria-pressed="false"
+                aria-label="Toggle microphone"
+              >
+                🎙
+              </button>
+              <div class="call-label" id="mic-label">Mute</div>
+            </div>
 
-            <button
-              id="speaker-btn"
-              class="btn circle"
-              type="button"
-              aria-pressed="true"
-              aria-label="Toggle speaker"
-            >
-              🔊
-            </button>
+            <div class="call-control">
+              <button
+                id="speaker-btn"
+                class="btn circle"
+                type="button"
+                aria-pressed="true"
+                aria-label="Toggle speaker"
+              >
+                🔊
+              </button>
+              <div class="call-label" id="speaker-label">Speaker</div>
+            </div>
           </div>
 
           <!-- Mode toggle -->
