@@ -1,8 +1,11 @@
 // app/home.js
 // Home (chat) page controller — desktop & mobile friendly
-// Now wired to Supabase conversation threads + Netlify chat function with memory.
+// Wired to Supabase conversation threads + Netlify chat function with memory.
+// ✅ FIXES:
+// 1) Hamburger now reliably appears (CSS handled in style.css, but we also ensure no JS hides it)
+// 2) Hamburger goes to history.html with returnTo + c (so back button works)
+// 3) Uses the correct query param when opening history (history.js expects returnTo)
 
-// Clear one-shot redirect flag so future logins work again
 sessionStorage.removeItem("sow_redirected");
 
 import { supabase, ensureAuthedOrRedirect, getSession } from "./supabase.js";
@@ -12,17 +15,12 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
 /* ------------------------------ config -------------------------------- */
-// Backend endpoint (Netlify function proxied as /api/chat)
 const CHAT_URL = "/api/chat";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
 // ⚠️ For development ONLY — never enable this on production.
 const DEV_DIRECT_OPENAI = false;
 
-// For dev, we read these from window.* so we never hardcode secrets in Git.
-// Create app/dev-local.js (gitignored) and set:
-//   window.OPENAI_DEV_KEY = "sk-...";
-//   window.OPENAI_MODEL   = "gpt-4o-mini";
 const DEV_OPENAI_MODEL = window.OPENAI_MODEL || "gpt-4o-mini";
 const DEV_OPENAI_KEY = window.OPENAI_DEV_KEY || "";
 
@@ -318,7 +316,7 @@ function appendBubble(role, text) {
   ensureChatScroll();
 }
 
-/* -------- NEW: load previous messages for this conversation --------- */
+/* -------- load previous messages for this conversation --------- */
 async function loadConversationHistory(convId) {
   if (!convId || !refs.chatBox) return;
   try {
@@ -342,8 +340,6 @@ async function loadConversationHistory(convId) {
       const bubbleRole = row.role === "assistant" ? "ai" : "user";
       appendBubble(bubbleRole, row.content || "");
     });
-
-    // status will be overwritten by boot()'s final setStatus
   } catch (err) {
     console.error("[HOME] loadConversationHistory failed:", err);
     setStatus("Could not load previous messages.", true);
@@ -351,7 +347,6 @@ async function loadConversationHistory(convId) {
 }
 
 /* ---------------------------- networking ------------------------------ */
-// Single entry point used by handleSend()
 async function chatRequest(text, meta = {}) {
   if (DEV_DIRECT_OPENAI) {
     return chatDirectOpenAI(text, meta);
@@ -360,7 +355,6 @@ async function chatRequest(text, meta = {}) {
   const res = await fetch(CHAT_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // IMPORTANT: use "message" so both Express server.js and Netlify function work
     body: JSON.stringify({ message: text, meta }),
   });
 
@@ -369,11 +363,9 @@ async function chatRequest(text, meta = {}) {
     throw new Error(`Chat ${res.status}: ${t || res.statusText}`);
   }
   const data = await res.json().catch(() => ({}));
-  // server returns: { reply, conversationId, summary, audio_base64?, audio_mime? }
   return data.reply ?? data.message ?? data.text ?? "";
 }
 
-/* ---- DEV ONLY: direct browser call to OpenAI (no server) ---- */
 async function chatDirectOpenAI(text, meta = {}) {
   const key = (DEV_OPENAI_KEY || "").trim();
   if (!key) {
@@ -445,7 +437,6 @@ async function handleSend() {
 }
 
 /* -------------------------- SPEAK (record) ---------------------------- */
-
 function pickSupportedMime() {
   const candidates = [
     { mime: "audio/webm;codecs=opus", ext: "webm" },
@@ -510,7 +501,6 @@ function stopRecording() {
 }
 
 /* -------------------------- tooltips (guides) -------------------------- */
-
 function isTouchLike() {
   return (
     window.matchMedia?.("(hover: none)").matches ||
@@ -529,8 +519,10 @@ function initTooltips() {
   document.body.appendChild(tt);
 
   const setContent = (el) => {
-    tt.querySelector(".tt-title").textContent = el.getAttribute("data-tt-title") || "";
-    tt.querySelector(".tt-body").textContent = el.getAttribute("data-tt-body") || "";
+    tt.querySelector(".tt-title").textContent =
+      el.getAttribute("data-tt-title") || "";
+    tt.querySelector(".tt-body").textContent =
+      el.getAttribute("data-tt-body") || "";
   };
 
   const position = (el) => {
@@ -541,8 +533,8 @@ function initTooltips() {
 
     const preferAbove = r.top > tr.height + 18;
 
-    let top = preferAbove ? (r.top - tr.height - 12) : (r.bottom + 12);
-    let left = (r.left + r.width / 2) - (tr.width / 2);
+    let top = preferAbove ? r.top - tr.height - 12 : r.bottom + 12;
+    let left = r.left + r.width / 2 - tr.width / 2;
 
     left = Math.max(12, Math.min(left, window.innerWidth - tr.width - 12));
     top = Math.max(12, Math.min(top, window.innerHeight - tr.height - 12));
@@ -650,7 +642,7 @@ function bindUI() {
     }
   });
 
-  // tools (stubs / routes)
+  // tools
   refs.callBtn?.addEventListener("click", () => {
     const url = new URL("call.html", window.location.origin);
     if (conversationId) url.searchParams.set("c", conversationId);
@@ -670,10 +662,16 @@ function bindUI() {
     }
   });
 
-  // history nav (hamburger)
+  // ✅ Conversations / history (hamburger)
   refs.hamburger?.addEventListener("click", () => {
     const url = new URL("history.html", window.location.origin);
+
+    // Pass current conversation (optional, for highlighting later if you want)
     if (conversationId) url.searchParams.set("c", conversationId);
+
+    // IMPORTANT: history.js expects ?returnTo=...
+    url.searchParams.set("returnTo", encodeURIComponent("home.html"));
+
     window.location.href = url.toString();
   });
 
@@ -690,7 +688,6 @@ function bindUI() {
 }
 
 /* ---------------------- conversation wiring --------------------------- */
-
 async function ensureConversationForUser(user) {
   const url = new URL(window.location.href);
   const params = url.searchParams;
@@ -748,7 +745,6 @@ async function ensureConversationForUser(user) {
 
   try {
     conversationId = await ensureConversationForUser(session.user);
-    // NEW: load any existing messages for this conversation
     await loadConversationHistory(conversationId);
   } catch (e) {
     console.error("[HOME] conversation init error:", e);
@@ -757,5 +753,9 @@ async function ensureConversationForUser(user) {
 
   bindUI();
   initTooltips();
+
+  // Ensure hamburger is visible even if something sets display:none elsewhere
+  if (refs.hamburger) refs.hamburger.style.display = "";
+
   setStatus("Signed in. How can I help?");
 })();

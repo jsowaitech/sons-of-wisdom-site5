@@ -10,23 +10,26 @@
 <body class="sow-shell chat-app">
   <!-- Top app bar -->
   <header class="appbar">
+    <!-- ✅ Hamburger icon button (3 bars). Style is in style.css: .icon-btn.hamburger span -->
     <button
       id="btn-menu"
       class="icon-btn hamburger"
       aria-label="Open conversations"
-      data-tt-title="Conversation History"
-      data-tt-body="View and switch between your past coaching conversations."
+      title="Conversation History"
+      type="button"
     >
       <span></span><span></span><span></span>
     </button>
 
-    <div class="powered tiny">powered by <span class="brand-mini">Son of Wisdom</span></div>
+    <div class="powered tiny">
+      powered by <span class="brand-mini">Son of Wisdom</span>
+    </div>
 
     <button
       id="btn-logout"
       class="btn small logout-btn"
-      data-tt-title="Logout"
-      data-tt-body="Sign out of your account."
+      title="Logout"
+      type="button"
     >
       Logout
     </button>
@@ -43,8 +46,7 @@
       <button
         class="chip"
         data-fill="Boosting energy and vitality tips"
-        data-tt-title="Quick Prompt"
-        data-tt-body="Fills the message box with a suggested question."
+        type="button"
       >
         Boosting energy and vitality tips
       </button>
@@ -52,8 +54,7 @@
       <button
         class="chip"
         data-fill="I feel stuck about my business"
-        data-tt-title="Quick Prompt"
-        data-tt-body="Fills the message box with a suggested question."
+        type="button"
       >
         I feel stuck about my business
       </button>
@@ -61,8 +62,7 @@
       <button
         class="chip"
         data-fill="Help me prepare for a tough conversation"
-        data-tt-title="Quick Prompt"
-        data-tt-body="Fills the message box with a suggested question."
+        type="button"
       >
         Help me prepare for a tough conversation
       </button>
@@ -72,8 +72,6 @@
       id="chat-panel"
       class="chat-panel"
       aria-live="polite"
-      data-tt-title="Conversation"
-      data-tt-body="Your messages and Son of Wisdom’s responses appear here."
     >
       <div id="chat-box" class="chat-box"></div>
     </section>
@@ -88,8 +86,7 @@
         <button
           id="btn-call"
           class="btn ghost pill"
-          data-tt-title="Voice Call"
-          data-tt-body="Start a live voice conversation."
+          type="button"
         >
           Call
         </button>
@@ -97,8 +94,7 @@
         <button
           id="btn-files"
           class="btn ghost pill"
-          data-tt-title="Upload Files (Coming Soon)"
-          data-tt-body="Add documents to give the coach more context."
+          type="button"
         >
           Files
         </button>
@@ -106,8 +102,7 @@
         <button
           id="btn-speak"
           class="btn ghost pill"
-          data-tt-title="Voice Input (Coming Soon)"
-          data-tt-body="Record your message using your microphone."
+          type="button"
         >
           Speak
         </button>
@@ -120,14 +115,11 @@
           type="text"
           placeholder="Ask Son of Wisdom AI…"
           autocomplete="off"
-          data-tt-title="Message Input"
-          data-tt-body="Type your message to Son of Wisdom here."
         />
         <button
           id="btn-send"
           class="btn primary dock-send"
-          data-tt-title="Send Message"
-          data-tt-body="Send your message to the AI coach."
+          type="button"
         >
           Send
         </button>
