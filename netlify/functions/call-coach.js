@@ -12,7 +12,7 @@
 // ✅ Adds strict KB instructions + a rewrite pass to conform output to KB lexicon
 //
 // FIX:
-// ✅ Defines KB_LEXICON_LOCK (your previous version referenced it but never defined it)
+// ✅ Defines KB_LEXICON_LOCK
 //
 // NEW (AUDIO RELIABILITY PATCH):
 // ✅ audio_expected: tells client we attempted/expected audio
@@ -26,13 +26,13 @@
 // NEW (TTS TEXT CLAMP IMPROVED):
 // ✅ Preserves paragraph breaks (newlines) while still removing markdown symbols
 //
-// ✅ NEW (UPLOAD FILE RAG):
-// ✅ Pulls relevant chunks from conversation_document_chunks for this conversationId
-// ✅ Uses Supabase RPC match_conversation_chunks(p_conversation_id, p_query_embedding, p_match_count)
-// ✅ Injects as "CONVERSATION FILE CONTEXT" so coach can reference uploaded PDFs/TXTs naturally
+// NEW (UNIFIED CONTEXT PIPELINE):
+// ✅ Uses shared buildUnifiedContext() for KB + memory + uploaded-file context
+// ✅ Keeps call mode aligned with chat mode context orchestration
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
+const { buildUnifiedContext } = require("./lib/context-builder.cjs");
 
 // ---------- ENV ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -47,10 +47,6 @@ const PINECONE_NAMESPACE = process.env.PINECONE_NAMESPACE || undefined;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_REST = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : null;
-
-// ✅ File-chunk retrieval tuning
-const FILE_CONTEXT_TOPK = Number(process.env.FILE_CONTEXT_TOPK || 6); // 4–8 is a good range
-const FILE_CONTEXT_MAX_CHARS = Number(process.env.FILE_CONTEXT_MAX_CHARS || 2800);
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
@@ -67,16 +63,16 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ✅ Always prevent caching (important on edge/CDN layers)
+// ✅ Always prevent caching
 const noStoreHeaders = {
   ...corsHeaders,
   "Content-Type": "application/json",
   "Cache-Control": "no-store",
 };
 
-// ---------- Timeouts (avoid Netlify hard timeout) ----------
-const OPENAI_TIMEOUT_MS = 16000; // chat + embed calls
-const ELEVEN_TIMEOUT_MS = 11000; // TTS call
+// ---------- Timeouts ----------
+const OPENAI_TIMEOUT_MS = 16000;
+const ELEVEN_TIMEOUT_MS = 11000;
 const SUPABASE_TIMEOUT_MS = 8000;
 const PINECONE_OVERALL_BUDGET_MS = 16000;
 
@@ -92,8 +88,8 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   }
 }
 
-// ---------- Anti-repeat memory (in-memory per warm lambda) ----------
-const NO_RESPONSE_MEMORY = new Map(); // key: callId|deviceId => { nudges:[], ends:[] }
+// ---------- Anti-repeat memory ----------
+const NO_RESPONSE_MEMORY = new Map();
 const MAX_RECENT_VARIANTS = 8;
 
 function getNoRespKey(callId, deviceId) {
@@ -123,11 +119,11 @@ function recentVariants(key, kind) {
   return (kind === "end" ? slot.ends : slot.nudges) || [];
 }
 
-// ---------- ✅ SINGLE-FLIGHT + DEDUPE (call mode critical) ----------
-const INFLIGHT = new Map(); // key => Promise(result)
-const RECENT_TURNS = new Map(); // key => { hash, at }
+// ---------- SINGLE-FLIGHT + DEDUPE ----------
+const INFLIGHT = new Map();
+const RECENT_TURNS = new Map();
 
-const DEDUPE_WINDOW_MS = 2500; // ignore repeated transcript within 2.5s
+const DEDUPE_WINDOW_MS = 2500;
 
 function stableKey(callId, deviceId, conversationId) {
   return `${callId || "no_call"}|${deviceId || "no_device"}|${
@@ -136,7 +132,10 @@ function stableKey(callId, deviceId, conversationId) {
 }
 
 function hashText(t) {
-  return crypto.createHash("sha1").update(String(t || "").trim()).digest("hex");
+  return crypto
+    .createHash("sha1")
+    .update(String(t || "").trim())
+    .digest("hex");
 }
 
 function isDuplicateTurn(key, transcript) {
@@ -237,7 +236,7 @@ In every reply:
 - No markdown formatting characters in your answers: do NOT use #, *, _, >, or backticks.
 - No bullet lists or numbered list lines in your answers.
 - No emojis.
-- No visible escape sequences like "\n" or "\t" as text. Use real line breaks instead.
+- No visible escape sequences like "\\n" or "\\t" as text. Use real line breaks instead.
 - Do not wrap the whole answer in quotation marks.
 - Use short, natural paragraphs that sound like live spoken words.
 
@@ -649,7 +648,7 @@ In your answers:
 
 - No markdown symbols (#, *, _, >, backticks).
 - No bullet or numbered lists.
-- No visible "\n" or "\t" text.
+- No visible "\\n" or "\\t" text.
 - Short, natural spoken paragraphs.
 
 This does NOT apply to this system prompt. It applies to your responses to the man.
@@ -670,7 +669,6 @@ Every answer must:
 All of it in short, TTS-safe, conversational responses.
 `.trim();
 
-// ✅ FIX: This constant was referenced but never defined in your previous file.
 const KB_LEXICON_LOCK = `
 KB LEXICON LOCK (CRITICAL)
 
@@ -719,29 +717,23 @@ function safeJsonParse(s, fallback = {}) {
   }
 }
 
-// Keep output TTS-safe + bounded (preserve paragraph breaks)
+// Keep output TTS-safe + bounded
 function clampTtsSafe(text, maxChars = 1200) {
   let s = String(text || "");
 
-  // normalize newlines
   s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-
-  // remove markdown-ish symbols
   s = s.replace(/[#*_>`]/g, "");
 
-  // trim each line and collapse internal spaces, but keep line breaks
   s = s
     .split("\n")
     .map((line) => line.replace(/\s+/g, " ").trim())
     .join("\n");
 
-  // collapse too many blank lines
   s = s.replace(/\n{3,}/g, "\n\n").trim();
 
   if (!s) return "";
   if (s.length <= maxChars) return s;
 
-  // truncate safely
   const cut = s.slice(0, maxChars - 1).trim();
   return cut + "…";
 }
@@ -826,7 +818,6 @@ async function getKnowledgeContext(question, topK = 10) {
 
     const vector = await openaiEmbedding(question);
 
-    // Soft budget check
     if (Date.now() - started > PINECONE_OVERALL_BUDGET_MS) return "";
 
     const target =
@@ -860,7 +851,7 @@ async function getKnowledgeContext(question, topK = 10) {
   }
 }
 
-// ---------- KB Lexicon rewrite pass (enforcement) ----------
+// ---------- KB Lexicon rewrite pass ----------
 async function rewriteToKbLexicon(draft, kbContext) {
   const kb = String(kbContext || "").trim();
   if (!kb) return draft;
@@ -899,7 +890,10 @@ Preserve short paragraphs with blank lines when helpful.
 }
 
 // ---------- Supabase REST helper ----------
-async function supaFetch(path, { method = "GET", headers = {}, query, body } = {}) {
+async function supaFetch(
+  path,
+  { method = "GET", headers = {}, query, body } = {}
+) {
   if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return null;
 
   const url = new URL(`${SUPABASE_REST}/${path}`);
@@ -939,37 +933,12 @@ async function supaFetch(path, { method = "GET", headers = {}, query, body } = {
   }
 }
 
-// Conversation helpers
-async function fetchConversation(conversationId) {
-  if (!conversationId) return null;
-  const rows = await supaFetch("conversations", {
-    query: {
-      select: "id,user_id,title,summary,updated_at,last_updated_at",
-      id: `eq.${conversationId}`,
-      limit: "1",
-    },
-  });
-  if (!Array.isArray(rows) || !rows.length) return null;
-  return rows[0];
-}
-
-async function fetchRecentMessages(conversationId, limit = 12) {
-  if (!conversationId) return [];
-  const rows = await supaFetch("conversation_messages", {
-    query: {
-      select: "role,content,created_at",
-      conversation_id: `eq.${conversationId}`,
-      order: "created_at.desc",
-      limit: String(limit),
-    },
-  });
-  if (!Array.isArray(rows)) return [];
-  return rows
-    .slice()
-    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-}
-
-async function insertConversationMessages(conversation, conversationId, userText, assistantText) {
+async function insertConversationMessages(
+  conversation,
+  conversationId,
+  userText,
+  assistantText
+) {
   if (!conversation || !conversationId || !conversation.user_id) return;
 
   const nowIso = new Date().toISOString();
@@ -1004,56 +973,7 @@ async function insertConversationMessages(conversation, conversationId, userText
   });
 }
 
-// ✅ NEW: pull relevant uploaded-file chunks for this conversation via RPC
-async function fetchConversationFileContext(conversationId, userMessage) {
-  try {
-    if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return "";
-    if (!conversationId || !isUuid(conversationId)) return "";
-    const q = String(userMessage || "").trim();
-    if (!q) return "";
-
-    // Embed the user query using the SAME embedding dims as your table (1536)
-    const queryEmbedding = await openaiEmbedding(q);
-
-    // Call your SQL function:
-    // match_conversation_chunks(p_conversation_id uuid, p_query_embedding vector(1536), p_match_count int default 8)
-    const rows = await supaFetch("rpc/match_conversation_chunks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        p_conversation_id: conversationId,
-        p_query_embedding: queryEmbedding,
-        p_match_count: FILE_CONTEXT_TOPK,
-      }),
-    });
-
-    if (!Array.isArray(rows) || !rows.length) return "";
-
-    // rows: [{ id, document_id, chunk_index, content, similarity }, ...]
-    const snippets = rows
-      .filter((r) => r && r.content)
-      .sort((a, b) => (b.similarity || 0) - (a.similarity || 0))
-      .map((r) => String(r.content || "").trim())
-      .filter(Boolean);
-
-    if (!snippets.length) return "";
-
-    // Bound total size so we don’t blow tokens
-    let out = "";
-    for (const s of snippets) {
-      const next = (out ? out + "\n\n---\n\n" : "") + s;
-      if (next.length > FILE_CONTEXT_MAX_CHARS) break;
-      out = next;
-    }
-
-    return out.trim();
-  } catch (e) {
-    console.error("[call-coach] fetchConversationFileContext error:", e);
-    return "";
-  }
-}
-
-// ---------- ElevenLabs TTS (hardened) ----------
+// ---------- ElevenLabs TTS ----------
 async function elevenLabsTTS(text) {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     return { audio: null, error: "Missing ELEVENLABS env vars" };
@@ -1084,17 +1004,26 @@ async function elevenLabsTTS(text) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    return { audio: null, error: `ElevenLabs ${res.status}: ${t || res.statusText}` };
+    return {
+      audio: null,
+      error: `ElevenLabs ${res.status}: ${t || res.statusText}`,
+    };
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
-  return { audio: { audio_base64: buf.toString("base64"), mime: "audio/mpeg" }, error: null };
+  return {
+    audio: { audio_base64: buf.toString("base64"), mime: "audio/mpeg" },
+    error: null,
+  };
 }
 
 async function tryInsertCallSession(row) {
   if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return;
 
-  const baseHeaders = { "Content-Type": "application/json", Prefer: "return=minimal" };
+  const baseHeaders = {
+    "Content-Type": "application/json",
+    Prefer: "return=minimal",
+  };
 
   try {
     await supaFetch("call_sessions", {
@@ -1142,7 +1071,8 @@ exports.handler = async (event) => {
 
     const source = String(body.source || "voice").toLowerCase();
 
-    const conversationId = body.conversationId || body.conversation_id || body.c || null;
+    const conversationId =
+      body.conversationId || body.conversation_id || body.c || null;
     const callId = body.call_id || body.callId || null;
     const deviceId = body.device_id || body.deviceId || null;
 
@@ -1161,7 +1091,6 @@ exports.handler = async (event) => {
 
     const key = stableKey(callId, deviceId, conversationId);
 
-    // ✅ Ignore duplicate turns that arrive back-to-back (frontend double-send)
     if (isDuplicateTurn(key, userMessageForAI)) {
       return {
         statusCode: 200,
@@ -1177,42 +1106,39 @@ exports.handler = async (event) => {
       };
     }
 
-    // ✅ SINGLE-FLIGHT: if multiple requests hit at once for same call, only generate once
     const result = await singleFlight(key, async () => {
-      // Conversation memory (optional)
-      let conversation = null;
-      let recentMessages = [];
-      if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY && conversationId) {
-        try {
-          conversation = await fetchConversation(conversationId);
-          recentMessages = await fetchRecentMessages(conversationId, 16);
-        } catch (e) {
-          console.error("[call-coach] Supabase fetch error:", e);
-        }
-      }
+      const unified = await buildUnifiedContext({
+        conversationId,
+        userMessage: userMessageForAI,
+        fetchRecentLimit: 16,
+        includeFileContext: true,
+        supaFetch,
+        openaiEmbedding,
+        getKnowledgeContext,
+        buildKBQuery,
+      });
 
-      const historySnippet = recentMessages.length
-        ? recentMessages
-            .map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.content || ""}`)
-            .join("\n")
-        : "—";
+      console.log("[call-coach] unified context:", {
+        hasKnowledge: unified.usedKnowledge,
+        hasFileContext: unified.usedFileContext,
+        recentMessages: unified.recentMessages?.length || 0,
+        conversationId,
+        callId: callId || null,
+      });
 
-      const conversationSummary = (conversation && conversation.summary) || "—";
-
-      // Pinecone KB context (optional)
-      const kbQuery = buildKBQuery(userMessageForAI);
-      const kbContext = await getKnowledgeContext(kbQuery);
-      const usedKnowledge = Boolean(kbContext && kbContext.trim());
-
-      // ✅ NEW: Conversation file context (uploaded PDFs/TXTs embedded into pgvector)
-      const fileContext = await fetchConversationFileContext(conversationId, userMessageForAI);
-      const usedFileContext = Boolean(fileContext && fileContext.trim());
+      const conversation = unified.conversation || null;
+      const recentMessages = unified.recentMessages || [];
+      const historySnippet = unified.historySnippet || "—";
+      const conversationSummary = unified.conversationSummary || "—";
+      const kbContext = unified.kbContext || "";
+      const usedKnowledge = Boolean(unified.usedKnowledge);
+      const fileContext = unified.fileContext || "";
+      const usedFileContext = Boolean(unified.usedFileContext);
 
       const messages = [];
       messages.push({ role: "system", content: SYSTEM_PROMPT_BLAKE });
       messages.push({ role: "system", content: KB_LEXICON_LOCK });
 
-      // ✅ Important: if greeting already happened, do NOT do the “first turn speech” again
       const greetingGuard = `
 CALL MODE INSTRUCTION
 If there is already an assistant greeting in the recent history, do NOT introduce yourself again.
@@ -1221,7 +1147,6 @@ Jump straight into DIAGNOSTIC mode on the man's situation.
 `.trim();
       messages.push({ role: "system", content: greetingGuard });
 
-      // 🔒 Tightened KB instruction (no wiggle room)
       const kbInstruction = `
 CRITICAL INSTRUCTION – KNOWLEDGE BASE LANGUAGE ONLY
 
@@ -1240,8 +1165,6 @@ ${kbContext || "EMPTY"}
 `.trim();
       messages.push({ role: "system", content: kbInstruction });
 
-      // ✅ NEW: Inject file context separately (this is the user’s uploaded content)
-      // This should be treated as “case material”, not “Son of Wisdom doctrine”.
       if (usedFileContext) {
         const fileInstruction = `
 CONVERSATION FILE CONTEXT (USER UPLOADED)
@@ -1280,17 +1203,13 @@ Use this context to stay consistent. Do not read this back to the user.
           maxTokens: 520,
         });
       } catch (e) {
-        // Fast fallback on OpenAI timeout/downstream stall
         console.error("[call-coach] OpenAI chat error:", e);
         rawReply =
           "I’m here with you. Say that again in one clear sentence, and tell me what happened right before it.";
       }
 
-      // TTS-safe clamp (preserve paragraphs)
       let reply = clampTtsSafe(rawReply, 1200);
 
-      // 🔒 Enforce KB lexicon with a rewrite pass (only if KB exists)
-      // Note: We do NOT force file excerpts into the KB lexicon. This pass is only for Son of Wisdom phrasing.
       try {
         reply = await rewriteToKbLexicon(reply, kbContext);
       } catch (e) {
@@ -1298,7 +1217,6 @@ Use this context to stay consistent. Do not read this back to the user.
         reply = clampTtsSafe(reply, 1200);
       }
 
-      // Supabase logging (optional)
       if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY) {
         const userId = String(body.user_id || "");
         const userUuid = pickUuidForHistory(userId);
@@ -1332,7 +1250,6 @@ Use this context to stay consistent. Do not read this back to the user.
         }
       }
 
-      // ElevenLabs TTS (reliability flags)
       const audio_expected = source === "voice" || source === "chat";
       let audio = null;
       let audio_error = null;
@@ -1342,7 +1259,9 @@ Use this context to stay consistent. Do not read this back to the user.
           const ttsRes = await elevenLabsTTS(reply);
           audio = ttsRes?.audio || null;
           audio_error = ttsRes?.error || null;
-          if (audio_error) console.error("[call-coach] TTS error:", audio_error);
+          if (audio_error) {
+            console.error("[call-coach] TTS error:", audio_error);
+          }
         } catch (e) {
           audio_error = String(e?.message || e);
           console.error("[call-coach] TTS throw:", e);
@@ -1364,7 +1283,9 @@ Use this context to stay consistent. Do not read this back to the user.
         responseBody.mime = audio.mime || "audio/mpeg";
       } else if (audio_expected) {
         responseBody.audio_missing = true;
-        if (audio_error) responseBody.audio_error = String(audio_error).slice(0, 180);
+        if (audio_error) {
+          responseBody.audio_error = String(audio_error).slice(0, 180);
+        }
       }
 
       return responseBody;

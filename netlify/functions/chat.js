@@ -4,8 +4,10 @@
 // - Supabase conversation memory (conversations + conversation_messages)
 // - Rolling summary per conversation
 // - Optional ElevenLabs TTS for voice mode
+// - Shared unified context builder for KB + memory + uploaded file context
 
 const { Pinecone } = require("@pinecone-database/pinecone");
+const { buildUnifiedContext } = require("./lib/context-builder.cjs");
 
 // ---------- ENV ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -152,7 +154,7 @@ In EVERY response:
 
   * Do not start lines with dashes or stars.
   * Do not write numbered lists like “1.” on separate lines.
-* Do NOT write visible escape sequences like "\n" or "\t".
+* Do NOT write visible escape sequences like "\\n" or "\\t".
 * Do NOT wrap the entire answer in quotation marks.
 * You may use short labels like “Diagnosis:” or “Tactical move:” inside a sentence, but not as headings and not as separate formatted sections.
 * Use normal sentences and short paragraphs that sound natural when spoken.
@@ -412,7 +414,7 @@ async function openaiEmbedding(text) {
     },
     body: JSON.stringify({
       model: OPENAI_EMBED_MODEL,
-      input: text,
+      input: String(text || "").slice(0, 8000),
     }),
   });
 
@@ -487,13 +489,7 @@ async function getKnowledgeContext(question, topK = 10) {
       .sort((a, b) => (b.score || 0) - (a.score || 0))
       .map((m) => {
         const md = m.metadata || {};
-        return (
-          md.text ||
-          md.chunk ||
-          md.content ||
-          md.body ||
-          ""
-        );
+        return md.text || md.chunk || md.content || md.body || "";
       })
       .filter(Boolean);
 
@@ -573,7 +569,6 @@ async function fetchRecentMessages(conversationId, limit = 12) {
     },
   });
   if (!Array.isArray(rows)) return [];
-  // sort oldest → newest
   return rows
     .slice()
     .sort(
@@ -760,7 +755,11 @@ async function elevenLabsTTS(text) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.error("[chat] ElevenLabs TTS error:", res.status, t || res.statusText);
+    console.error(
+      "[chat] ElevenLabs TTS error:",
+      res.status,
+      t || res.statusText
+    );
     return null;
   }
 
@@ -802,35 +801,35 @@ exports.handler = async (event) => {
     const source = (meta.source || "chat").toLowerCase(); // "chat" or "voice"
     const conversationId = meta.conversationId || null;
 
-    // 1) Supabase: fetch conversation + recent messages
-    let conversation = null;
-    let recentMessages = [];
-    if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY && conversationId) {
-      try {
-        conversation = await fetchConversation(conversationId);
-        recentMessages = await fetchRecentMessages(conversationId, 12);
-      } catch (e) {
-        console.error("[chat] Supabase fetch error:", e);
-      }
-    }
+    // 1) Unified context: summary + recent history + KB + uploaded file context
+    const unified = await buildUnifiedContext({
+      conversationId,
+      userMessage,
+      fetchRecentLimit: 12,
+      includeFileContext: true,
+      supaFetch,
+      openaiEmbedding,
+      getKnowledgeContext,
+      buildKBQuery,
+    });
 
-    const historySnippet = recentMessages.length
-      ? recentMessages
-          .map(
-            (m) =>
-              `${m.role === "user" ? "User" : "Coach"}: ${m.content || ""}`
-          )
-          .join("\n")
-      : "—";
+    console.log("[chat] unified context:", {
+      hasKnowledge: unified.usedKnowledge,
+      hasFileContext: unified.usedFileContext,
+      recentMessages: unified.recentMessages?.length || 0,
+      conversationId,
+    });
 
-    const rollingSummary = (conversation && conversation.summary) || "—";
+    const conversation = unified.conversation || null;
+    const recentMessages = unified.recentMessages || [];
+    const historySnippet = unified.historySnippet || "—";
+    const rollingSummary = unified.conversationSummary || "—";
+    const kbContext = unified.kbContext || "";
+    const usedKnowledge = Boolean(unified.usedKnowledge);
+    const fileContext = unified.fileContext || "";
+    const usedFileContext = Boolean(unified.usedFileContext);
 
-    // 2) Pinecone KB context
-    const kbQuery = buildKBQuery(userMessage);
-    const kbContext = await getKnowledgeContext(kbQuery);
-    const usedKnowledge = Boolean(kbContext && kbContext.trim());
-
-    // 3) Build messages
+    // 2) Build messages
     const messages = [];
 
     messages.push({ role: "system", content: SYSTEM_PROMPT_BLAKE });
@@ -856,6 +855,27 @@ ${kbContext || "No relevant Son of Wisdom knowledge base passages were retrieved
 
     messages.push({ role: "system", content: kbInstruction });
 
+    const fileInstruction = usedFileContext
+      ? `
+CONVERSATION FILE CONTEXT (USER UPLOADED)
+
+The user has uploaded files earlier in this conversation. The following excerpts are from those files.
+Use them as factual context and reference them naturally if relevant.
+Do not claim these excerpts are Son of Wisdom doctrine unless the excerpt itself is Son of Wisdom material.
+Do not mention embeddings, retrieval, vector search, or internal tooling.
+
+USER FILE CONTEXT:
+
+${fileContext}
+`.trim()
+      : `
+CONVERSATION FILE CONTEXT (USER UPLOADED)
+
+No relevant uploaded file excerpts were retrieved for this turn.
+`.trim();
+
+    messages.push({ role: "system", content: fileInstruction });
+
     const memoryInstruction = `
 Conversation memory context for this thread.
 
@@ -872,10 +892,10 @@ Use this context to stay consistent with what has already been shared. Do not re
 
     messages.push({ role: "user", content: userMessage });
 
-    // 4) Call OpenAI
+    // 3) Call OpenAI
     const reply = await openaiChat(messages);
 
-    // 5) Supabase logging
+    // 4) Supabase logging
     let updatedSummary = rollingSummary === "—" ? null : rollingSummary;
     if (
       SUPABASE_REST &&
@@ -911,7 +931,7 @@ Use this context to stay consistent with what has already been shared. Do not re
       }
     }
 
-    // 6) Optional TTS for voice mode
+    // 5) Optional TTS for voice mode
     let audio = null;
     if (source === "voice") {
       try {
@@ -921,10 +941,11 @@ Use this context to stay consistent with what has already been shared. Do not re
       }
     }
 
-    // 7) Response
+    // 6) Response
     const responseBody = {
       reply,
       usedKnowledge,
+      usedFileContext,
       conversationId: conversationId || null,
       summary: updatedSummary || null,
     };

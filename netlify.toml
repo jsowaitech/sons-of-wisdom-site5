@@ -23,3 +23,8 @@
   from = "/api/call/greeting"
   to   = "/.netlify/functions/call-greeting"
   status = 200
+
+[[redirects]]
+  from = "/api/hume-token"
+  to = "/.netlify/functions/hume-token"
+  status = 200

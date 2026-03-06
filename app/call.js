@@ -18,6 +18,7 @@
 // - ✅ FIX (CRITICAL iOS): PRIME mic + audio + AudioContexts inside the SAME user gesture (prevents “stuck connecting”)
 // - ✅ FIX (CRITICAL iOS): Create MediaElementSource ONLY ONCE (prevents InvalidStateError)
 // - ✅ PREMIUM PRESENCE (NEW): “Blake has joined” moment + “Blake speaking…” + soft handoff to Listening
+// - ✅ SECURITY: Hume realtime now uses short-lived backend tokens instead of a browser-exposed API key
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -27,6 +28,10 @@ const warn = (...a) => DEBUG && console.warn("[SOW]", ...a);
 const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 const TRANSCRIBE_ENDPOINT = "/.netlify/functions/openai-transcribe";
 const CALL_GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
+const HUME_TOKEN_ENDPOINT = "/api/hume-token";
+
+/* ---------- FEATURES ---------- */
+const HUME_ENABLED = true;
 
 /* ---------- TRANSCRIBE MODEL ---------- */
 const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
@@ -71,7 +76,7 @@ let isMerging = false;
 
 /* audio recording */
 let globalStream = null;
-let micPromise = null; // ✅ PRIME getUserMedia within user gesture, await later
+let micPromise = null;
 let mediaRecorder = null;
 let recordChunks = [];
 let recordMimeType = "audio/webm";
@@ -86,8 +91,12 @@ let vadState = "idle";
 let lastVoiceTime = 0;
 let speechStartTime = 0;
 
+/* Hume realtime */
+let humeReady = false;
+let humeActive = false;
+
 /* ✅ require voice hold before start (prevents noise triggers) */
-const VAD_START_HOLD_MS = 140; // 120–180ms recommended
+const VAD_START_HOLD_MS = 140;
 let vadStartCandidateAt = 0;
 
 /* Adaptive noise floor */
@@ -95,15 +104,15 @@ let noiseFloor = 0.012;
 let lastNoiseUpdate = 0;
 
 /* Phone-call pace tuning */
-const VAD_SILENCE_MS = 1500; // slightly more forgiving
+const VAD_SILENCE_MS = 1500;
 const VAD_MERGE_WINDOW_MS = 1700;
-const VAD_MIN_SPEECH_MS = 520; // ignore more short noise blips
+const VAD_MIN_SPEECH_MS = 520;
 const VAD_IDLE_TIMEOUT_MS = 30000;
 
 /* ✅ Less sensitive threshold shaping */
 const NOISE_FLOOR_UPDATE_MS = 300;
-const THRESHOLD_MULTIPLIER = 2.85; // higher = less sensitive
-const THRESHOLD_MIN = 0.026; // higher floor = less sensitive
+const THRESHOLD_MULTIPLIER = 2.85;
+const THRESHOLD_MIN = 0.026;
 const THRESHOLD_MAX = 0.11;
 
 /* ✅ Stronger hysteresis (reduces jitter/noise triggers) */
@@ -125,12 +134,12 @@ const IS_IOS =
 /* ---------- Shared AI audio player + analyser ---------- */
 let ttsPlayer = null;
 let playbackAC = null;
-let playbackSource = null; // ✅ IMPORTANT: only create MediaElementSource once
+let playbackSource = null;
 let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
 
-/* playback epoch guard (prevents stale ended/error) */
+/* playback epoch guard */
 let playbackEpoch = 0;
 
 /* AI speaking flags */
@@ -162,26 +171,26 @@ let lastUserSentText = "";
 let lastUserSentAt = 0;
 const USER_TURN_DEDUPE_MS = 2200;
 
-/* Playback queue (fixes “alternating skip”) */
+/* Playback queue */
 const ttsQueue = [];
 let ttsDraining = false;
 
 /* Debug HUD */
 let debugOn = false;
 
-/* Status flags (fix UI inaccuracies) */
+/* Status flags */
 let isTranscribing = false;
 let isThinking = false;
 let pausedInBackground = false;
 let transientStatus = "";
 let transientUntil = 0;
 
-/* ✅ Call phases (premium presence) */
+/* ✅ Call phases */
 let callPhase = "idle"; // idle | requesting_mic | ringing | joined | greeting | live
 
 /* ✅ Premium presence micro-timing */
-const PRESENCE_JOIN_MS = 420;   // small intentional moment after ring
-const PRESENCE_HANDOFF_MS = 1200; // “Blake is here. Go ahead…” before Listening
+const PRESENCE_JOIN_MS = 420;
+const PRESENCE_HANDOFF_MS = 1200;
 
 /* ---------- Helpers ---------- */
 function setStatus(t) {
@@ -196,9 +205,6 @@ function setTransientStatus(t, ms = 1600) {
 }
 
 function renderStatus() {
-  // Priority order:
-  // not calling > paused > phase-specific > Blake speaking > transcribing > thinking > merging > transient > mic muted > live listening
-
   if (!isCalling) {
     setStatus("Tap the blue call button to begin.");
     return;
@@ -209,7 +215,6 @@ function renderStatus() {
     return;
   }
 
-  // Phase messaging first (prevents “Listening” during ring/greeting)
   if (callPhase === "requesting_mic") {
     setStatus("Connecting microphone…");
     return;
@@ -268,7 +273,6 @@ function setInterim(t) {
   transcriptInterim.textContent = t || "";
 }
 
-/* ✅ FIX: scroll the REAL scroller (#tsList), not the inner list */
 function addFinalLine(t) {
   if (!transcriptList) return;
   const s = (t || "").trim();
@@ -308,6 +312,55 @@ function sleep(ms) {
 function setDebugText(t) {
   if (!debugEl) return;
   debugEl.textContent = t || "";
+}
+
+/* ---------- Hume ---------- */
+async function initHumeRealtime() {
+  if (!HUME_ENABLED) return false;
+  if (humeReady) return true;
+
+  const api = window.HumeRealtime;
+  if (!api?.init) {
+    warn("HumeRealtime is not loaded on the page");
+    return false;
+  }
+
+  try {
+    await api.init({
+      enable: true,
+      tokenEndpoint: HUME_TOKEN_ENDPOINT,
+    });
+    humeReady = true;
+    log("✅ HumeRealtime initialized");
+    return true;
+  } catch (e) {
+    warn("initHumeRealtime failed", e);
+    return false;
+  }
+}
+
+async function startHumeRealtime() {
+  if (!HUME_ENABLED || humeActive || !isCalling) return;
+  const ok = await initHumeRealtime();
+  if (!ok) return;
+
+  try {
+    const stream = globalStream || (await ensureMicStream());
+    await window.HumeRealtime.startTurn(stream, vadAC || undefined);
+    humeActive = true;
+    log("✅ HumeRealtime started");
+  } catch (e) {
+    warn("startHumeRealtime failed", e);
+  }
+}
+
+function stopHumeRealtime() {
+  try {
+    window.HumeRealtime?.stopTurn?.();
+  } catch (e) {
+    warn("stopHumeRealtime failed", e);
+  }
+  humeActive = false;
 }
 
 /* ---------- Buttons ---------- */
@@ -350,7 +403,6 @@ speakerBtn?.addEventListener("click", () => {
   const lbl = document.getElementById("speaker-label");
   if (lbl) lbl.textContent = speakerMuted ? "Speaker Off" : "Speaker";
 
-  // If unmuting, resume draining queued TTS
   if (!speakerMuted) drainTTSQueue();
 
   renderStatus();
@@ -370,12 +422,14 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-/* Visibility handling (iOS hardening) */
+/* Visibility handling */
 document.addEventListener("visibilitychange", async () => {
   if (!isCalling) return;
 
   if (document.hidden) {
     pausedInBackground = true;
+
+    stopHumeRealtime();
 
     try {
       ttsPlayer?.pause();
@@ -384,7 +438,6 @@ document.addEventListener("visibilitychange", async () => {
       if (isRecording) await stopRecordingTurn({ discard: true });
     } catch {}
 
-    // Reset VAD/merge so we don't come back in a weird state.
     vadState = "idle";
     vadStartCandidateAt = 0;
     bargeVoiceStart = 0;
@@ -397,11 +450,15 @@ document.addEventListener("visibilitychange", async () => {
     renderStatus();
   } else {
     pausedInBackground = false;
-    // iOS may suspend audio contexts in background—try to revive gently
     await unlockAudioSystem().catch(() => {});
     try {
       if (vadAC?.state === "suspended") await vadAC.resume().catch(() => {});
     } catch {}
+
+    if (callPhase === "live") {
+      await startHumeRealtime();
+    }
+
     renderStatus();
   }
 });
@@ -438,12 +495,10 @@ async function unlockAudioSystem() {
 
   playbackAC ||= new (window.AudioContext || window.webkitAudioContext)();
 
-  // Try to resume if suspended (some iOS cases)
   if (playbackAC.state === "suspended") {
     await playbackAC.resume().catch(() => {});
   }
 
-  // ✅ IMPORTANT: Only create MediaElementSource ONCE per <audio> element.
   if (!playbackSource) {
     playbackSource = playbackAC.createMediaElementSource(ttsPlayer);
   }
@@ -457,7 +512,6 @@ async function unlockAudioSystem() {
     playbackAnalyser.connect(playbackAC.destination);
   }
 
-  // iOS: prime a play() once during user gesture
   if (IS_IOS && !audioUnlocked) {
     const a = ensureSharedAudio();
     a.src =
@@ -478,15 +532,11 @@ async function unlockAudioSystem() {
   }
 }
 
-/* ✅ CRITICAL iOS: PRIME mic+audio+contexts in SAME user gesture */
 function primeIOSGesture() {
   try {
     ensureSharedAudio();
-
-    // Kick off unlock attempt inside gesture (don't await)
     unlockAudioSystem().catch(() => {});
 
-    // Start mic permission request inside gesture (don't await)
     if (!micPromise && !globalStream) {
       micPromise = navigator.mediaDevices
         .getUserMedia({
@@ -509,31 +559,31 @@ function primeIOSGesture() {
         });
     }
 
-    // Prime VAD AudioContext creation
     if (!vadAC) {
       vadAC = new (window.AudioContext || window.webkitAudioContext)();
       if (vadAC.state === "suspended") {
         vadAC.resume().catch(() => {});
       }
     }
+
+    initHumeRealtime().catch(() => {});
   } catch (e) {
     warn("primeIOSGesture failed", e);
   }
 }
 
-/* ---------- ring.mp3 SFX (✅ iOS-safe: use SHARED unlocked audio) ---------- */
+/* ---------- ring.mp3 SFX ---------- */
 async function playRingTwiceOnConnect() {
   if (ringPlayed) return;
   ringPlayed = true;
 
-  // Even if ring audio is blocked, keep UX “ringing” via delay.
   const RING_FALLBACK_MS = 2300;
 
   try {
-    const a = ensureSharedAudio(); // ✅ use the already-unlocked player
+    const a = ensureSharedAudio();
 
     const playOnce = async () => {
-      playbackEpoch++; // invalidate old handlers
+      playbackEpoch++;
       try {
         a.pause();
       } catch {}
@@ -734,7 +784,6 @@ async function stopRecordingTurn({ discard = false } = {}) {
 async function transcribeTurn() {
   if (!recordChunks.length) return "";
 
-  // ✅ ignore very small recordings (noise / accidental trigger)
   const totalSize = recordChunks.reduce((sum, c) => sum + (c?.size || 0), 0);
   if (totalSize < 8000) {
     log("⚠️ Ignoring tiny audio blob:", totalSize);
@@ -817,7 +866,6 @@ function queueMergedSend(transcript) {
     if (!final) return;
     if (!isCalling) return;
 
-    // DEDUPE (prevents multiple AI replies from same spoken line)
     const now = Date.now();
     if (
       final === lastUserSentText &&
@@ -836,7 +884,7 @@ function queueMergedSend(transcript) {
   }, VAD_MERGE_WINDOW_MS);
 }
 
-/* ---------- Turn queue drain (prevents multi replies) ---------- */
+/* ---------- Turn queue drain ---------- */
 async function drainTurnQueue() {
   if (drainingTurns) return;
   drainingTurns = true;
@@ -860,7 +908,6 @@ async function enqueueTTS(base64, mime) {
   if (!base64) return;
   ttsQueue.push({ base64, mime: mime || "audio/mpeg" });
 
-  // Only drain if speaker is on; if muted, we keep queued for later.
   if (!speakerMuted) drainTTSQueue();
 }
 
@@ -877,7 +924,6 @@ async function drainTTSQueue() {
       aiSpeechStart = performance.now();
       renderStatus();
 
-      // While Blake is speaking, stop recording (prevents echo->double replies)
       if (isRecording) await stopRecordingTurn({ discard: true });
 
       const ok = await playDataUrlTTS(item.base64, item.mime);
@@ -915,12 +961,11 @@ function waitOnce(target, event, ms = 2000) {
   });
 }
 
-/* --- Unskippable Safari-safe playback: epoch guard + stall watchdog --- */
+/* --- Safari-safe playback --- */
 async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) {
   const a = ensureSharedAudio();
   const myEpoch = ++playbackEpoch;
 
-  // hard reset (Safari reliability)
   try {
     a.pause();
   } catch {}
@@ -974,9 +1019,8 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
       resolve(ok);
     };
 
-    // Stall watchdog: if time doesn't advance while playing, retry play()
     stallTimer = setInterval(() => {
-      if (myEpoch !== playbackEpoch) return; // stale playback
+      if (myEpoch !== playbackEpoch) return;
       if (a.paused) return;
 
       const t = a.currentTime || 0;
@@ -1051,7 +1095,6 @@ async function playGreetingOnce() {
     if (b64) {
       await enqueueTTS(b64, mime);
 
-      // While greeting is playing, make sure status stays premium
       if (!speakerMuted) {
         isPlayingAI = true;
         aiSpeechStart = performance.now();
@@ -1109,7 +1152,7 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
 
     const data = await resp.json().catch(() => ({}));
     if (!isCalling) return false;
-    if (seq !== coachSeq) return false; // stale
+    if (seq !== coachSeq) return false;
 
     const replyText = (data?.assistant_text || data?.text || "").trim();
     if (replyText) addFinalLine("AI: " + replyText);
@@ -1137,7 +1180,7 @@ function stopAIForBargeIn() {
   if (!ttsPlayer) return;
   if (!isPlayingAI) return;
 
-  playbackEpoch++; // invalidate any pending ended/error from old src
+  playbackEpoch++;
 
   try {
     ttsPlayer.pause();
@@ -1146,16 +1189,13 @@ function stopAIForBargeIn() {
     ttsPlayer.currentTime = 0;
   } catch {}
 
-  // stop pending audio in queue
   ttsQueue.length = 0;
 
-  // cancel in-flight coach (prevents late reply)
   try {
     coachAbort?.abort();
   } catch {}
   coachAbort = null;
 
-  // clear merge buffer so we don't send stale partials right after barge-in
   try {
     if (mergeTimer) clearTimeout(mergeTimer);
   } catch {}
@@ -1192,17 +1232,14 @@ async function startVADLoop() {
     const now = performance.now();
     const thr = computeAdaptiveThreshold();
 
-    // Hysteresis thresholds
     const startThr = thr * VAD_START_MULT;
     const contThr = thr * VAD_CONT_MULT;
 
-    // If Blake is speaking and speaker is ON, do NOT start recording from echo.
     const allowVADStart = !(isPlayingAI && !speakerMuted);
 
     const isVoiceStart = !micMuted && energy > startThr;
     const isVoiceCont = !micMuted && energy > contThr;
 
-    // BARGE-IN: only when AI speaking
     if (isPlayingAI && !micMuted) {
       const canBarge = now - aiSpeechStart > BARGE_COOLDOWN_MS;
       const isLoudVoice = energy > thr * BARGE_EXTRA_MULT;
@@ -1221,7 +1258,6 @@ async function startVADLoop() {
     }
 
     if (vadState === "idle") {
-      // ✅ require voice HOLD before starting record
       if (allowVADStart && isVoiceStart) {
         if (!vadStartCandidateAt) vadStartCandidateAt = now;
 
@@ -1245,7 +1281,6 @@ async function startVADLoop() {
       } else {
         vadStartCandidateAt = 0;
 
-        // learn noise floor only when idle
         if (!micMuted && allowVADStart) maybeUpdateNoiseFloor(energy, now);
       }
     } else if (vadState === "speaking") {
@@ -1297,7 +1332,8 @@ async function startVADLoop() {
           `phase=${callPhase}  AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
           `energy=${energy.toFixed(4)}  noise=${noiseFloor
             .toFixed(4)}  thr=${thr.toFixed(4)}\n` +
-          `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
+          `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}\n` +
+          `humeReady=${humeReady}  humeActive=${humeActive}`
       );
     }
 
@@ -1439,11 +1475,8 @@ function stopTimer() {
 
 /* ---------- Call controls ---------- */
 callBtn?.addEventListener("click", () => {
-  // ✅ MUST be synchronous to preserve iOS user-gesture privileges:
-  // prime mic permission + audio context + unlock attempt right here.
   primeIOSGesture();
 
-  // Now run the async flow (gesture priming already happened)
   if (!isCalling) startCall();
   else endCall();
 });
@@ -1483,41 +1516,36 @@ async function startCall() {
   startTimer();
 
   try {
-    // 1) Request mic (await after prime; if already primed, resolves quickly)
     callPhase = "requesting_mic";
     renderStatus();
     await ensureMicStream();
+    await initHumeRealtime();
 
-    // 2) Ring
     callPhase = "ringing";
     renderStatus();
     await playRingTwiceOnConnect();
 
-    // ✅ PREMIUM: tiny “joined” moment before greeting
     callPhase = "joined";
     renderStatus();
     await sleep(PRESENCE_JOIN_MS);
 
-    // 3) Bring up VAD + visuals
     await setupVAD();
     setupRingCanvas();
     if (!ringRAF) drawRings();
 
-    // 4) Greeting
     callPhase = "greeting";
     renderStatus();
     await playGreetingOnce();
 
-    // Ensure greeting drained before moving on
     if (!speakerMuted) await drainTTSQueue();
 
-    // ✅ PREMIUM: warm handoff before Listening
     setTransientStatus("Blake is here. Go ahead…", PRESENCE_HANDOFF_MS);
-    await sleep(Math.min(420, PRESENCE_HANDOFF_MS)); // don’t over-delay; just enough to feel intentional
+    await sleep(Math.min(420, PRESENCE_HANDOFF_MS));
 
-    // 5) Live
     callPhase = "live";
     renderStatus();
+
+    await startHumeRealtime();
     await startVADLoop();
   } catch (e) {
     warn("startCall error", e);
@@ -1527,7 +1555,6 @@ async function startCall() {
 }
 
 function closeAudioContexts() {
-  // VAD chain can be safely closed on endCall.
   try {
     vadSource?.disconnect();
   } catch {}
@@ -1543,9 +1570,6 @@ function closeAudioContexts() {
   } catch {}
   vadAC = null;
 
-  // ✅ IMPORTANT iOS FIX:
-  // Do NOT close the playback AudioContext (and do NOT recreate MediaElementSource).
-  // Instead, suspend it to reduce CPU/battery.
   try {
     playbackAC?.suspend?.();
   } catch {}
@@ -1588,6 +1612,7 @@ function endCall() {
   isTranscribing = false;
   isThinking = false;
 
+  stopHumeRealtime();
   stopRing();
 
   try {
@@ -1621,6 +1646,7 @@ function endCall() {
 /* ---------- Boot ---------- */
 ensureSharedAudio();
 renderStatus();
+initHumeRealtime().catch(() => {});
 log(
-  "✅ call.js loaded: iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM presence phases (Connecting mic / Calling Blake / Blake joined / Blake speaking / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded: secure Hume token flow + iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM presence phases (Connecting mic / Calling Blake / Blake joined / Blake speaking / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
 );

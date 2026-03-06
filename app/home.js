@@ -1,11 +1,9 @@
 // app/home.js
-// Home (chat) page controller — desktop & mobile friendly
-// Supabase conversations + Netlify functions:
-// - call-coach (chat/voice + optional TTS)
-// - openai-transcribe (multipart audio transcription)
-// - upload-file (store file in Supabase Storage)
-// - file-extract (extract text from PDF/TXT via multipart)
-// - process-upload (index/chunk/embed into Supabase tables)
+// Son of Wisdom — Home (chat) page controller
+// Unified with backend context pipeline metadata:
+// - surfaces usedKnowledge / usedFileContext
+// - injects a lightweight context strip above chat
+// - keeps chat, speak, file upload, history, and optional voice replies
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -25,31 +23,40 @@ const EXTRACT_URL = "/.netlify/functions/file-extract";
 const PROCESS_UPLOAD_URL = "/.netlify/functions/process-upload";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
-// ⚠️ For development ONLY — never enable this on production.
+// Never enable this on production.
 const DEV_DIRECT_OPENAI = false;
-
 const DEV_OPENAI_MODEL = window.OPENAI_MODEL || "gpt-4o-mini";
 const DEV_OPENAI_KEY = window.OPENAI_DEV_KEY || "";
 
-// System prompt for DEV_DIRECT_OPENAI only (server has its own prompt)
+// System prompt for DEV_DIRECT_OPENAI only
 const DEV_SYSTEM_PROMPT = `
 AI BLAKE – SON OF WISDOM COACH
 TTS-SAFE • CONVERSATIONAL • DIAGNOSTIC-FIRST • SHORT RESPONSES • VARIATION • NO DEEP-DIVE
-
 YOU ARE: AI BLAKE
 `.trim();
 
 /* ------------------------------ state -------------------------------- */
 let session = null;
 let sending = false;
-let conversationId = null; // Supabase conversations.id
+let conversationId = null;
 
-// audio-recording state (Speak button)
 let recording = false;
 let mediaStream = null;
 let mediaRecorder = null;
 let mediaChunks = [];
 let chosenMime = { mime: "audio/webm;codecs=opus", ext: "webm" };
+
+let voiceRepliesEnabled = false;
+
+const contextState = {
+  conversationTitle: "New conversation",
+  lastMode: "chat",
+  lastUsedKnowledge: false,
+  lastUsedFileContext: false,
+  attachedArtifacts: [],
+  fileIndexingInFlight: false,
+  lastUpdatedAt: null,
+};
 
 /* ------------------------------ UI refs ------------------------------- */
 const refs = {
@@ -64,21 +71,19 @@ const refs = {
   chatBox: $("#chat-box"),
   logoutBtn: $("#btn-logout"),
   hamburger: $("#btn-menu"),
+  content: $(".content"),
+  chatPanel: $("#chat-panel"),
 };
 
 /* =========================================================
-   ✅ iOS Safari-safe audio playback (Home)
+   iOS Safari-safe audio playback
    ========================================================= */
-
 const IS_IOS =
   /iPad|iPhone|iPod/i.test(navigator.userAgent || "") ||
   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 let ttsPlayer = null;
 let audioUnlocked = false;
-
-// ✅ default OFF
-let voiceRepliesEnabled = false;
 
 function ensureSharedAudio() {
   if (ttsPlayer) return ttsPlayer;
@@ -91,7 +96,7 @@ function ensureSharedAudio() {
   return ttsPlayer;
 }
 
-// Must be called on a user gesture (click/tap) on iOS
+// Must be called on a user gesture on iOS
 async function unlockAudioSystem() {
   try {
     ensureSharedAudio();
@@ -139,17 +144,173 @@ async function playAudioUrl(url) {
   }
 }
 
-/* Render a message bubble + optional "Play" fallback button */
+/* --------------------------- context strip ---------------------------- */
+function ensureContextStrip() {
+  if ($("#context-strip")) return $("#context-strip");
+
+  const strip = document.createElement("section");
+  strip.id = "context-strip";
+  strip.setAttribute("aria-label", "Conversation context");
+  strip.style.cssText = [
+    "display:flex",
+    "flex-wrap:wrap",
+    "align-items:center",
+    "gap:0.55rem",
+    "margin:0 0 0.9rem",
+    "padding:0.7rem 0.85rem",
+    "border-radius:16px",
+    "background:rgba(10,18,34,0.88)",
+    "border:1px solid rgba(148,163,184,0.22)",
+    "box-shadow:0 12px 32px rgba(0,0,0,0.35)",
+  ].join(";");
+
+  strip.innerHTML = `
+    <div id="ctx-conversation" class="ctx-pill">Conversation: New conversation</div>
+    <div id="ctx-memory" class="ctx-pill">Memory: on</div>
+    <div id="ctx-kb" class="ctx-pill">KB: idle</div>
+    <div id="ctx-files" class="ctx-pill">Artifacts: 0</div>
+    <div id="ctx-voice" class="ctx-pill">Voice replies: off</div>
+    <div id="ctx-mode" class="ctx-pill">Mode: chat</div>
+  `;
+
+  if (refs.chatPanel?.parentElement) {
+    refs.chatPanel.parentElement.insertBefore(strip, refs.chatPanel);
+  } else if (refs.content) {
+    refs.content.appendChild(strip);
+  } else {
+    document.body.appendChild(strip);
+  }
+
+  addContextStripStyles();
+  return strip;
+}
+
+function addContextStripStyles() {
+  if ($("#context-strip-inline-styles")) return;
+
+  const style = document.createElement("style");
+  style.id = "context-strip-inline-styles";
+  style.textContent = `
+    #context-strip .ctx-pill{
+      display:inline-flex;
+      align-items:center;
+      gap:.35rem;
+      padding:.36rem .72rem;
+      border-radius:999px;
+      font-size:.78rem;
+      line-height:1;
+      color:#e5edf8;
+      border:1px solid rgba(148,163,184,.24);
+      background:rgba(15,23,42,.72);
+      white-space:nowrap;
+    }
+    #context-strip .ctx-pill[data-state="active"]{
+      border-color:rgba(246,201,121,.58);
+      background:rgba(246,201,121,.12);
+      color:#f6d99a;
+    }
+    #context-strip .ctx-pill[data-state="good"]{
+      border-color:rgba(74,222,128,.5);
+      background:rgba(74,222,128,.12);
+      color:#baf5c8;
+    }
+    #context-strip .ctx-pill[data-state="warn"]{
+      border-color:rgba(248,113,113,.55);
+      background:rgba(248,113,113,.12);
+      color:#fecaca;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function updateContextStrip() {
+  ensureContextStrip();
+
+  const convEl = $("#ctx-conversation");
+  const memEl = $("#ctx-memory");
+  const kbEl = $("#ctx-kb");
+  const filesEl = $("#ctx-files");
+  const voiceEl = $("#ctx-voice");
+  const modeEl = $("#ctx-mode");
+
+  if (convEl) {
+    convEl.textContent = `Conversation: ${
+      contextState.conversationTitle || "New conversation"
+    }`;
+  }
+
+  if (memEl) {
+    memEl.textContent = "Memory: on";
+    memEl.dataset.state = "good";
+  }
+
+  if (kbEl) {
+    kbEl.textContent = `KB: ${
+      contextState.lastUsedKnowledge ? "used" : "idle"
+    }`;
+    kbEl.dataset.state = contextState.lastUsedKnowledge ? "active" : "";
+  }
+
+  if (filesEl) {
+    const count = contextState.attachedArtifacts.length || 0;
+    const suffix = contextState.fileIndexingInFlight ? " (indexing…)" : "";
+    filesEl.textContent = `Artifacts: ${count}${suffix}`;
+    filesEl.dataset.state =
+      count > 0 ? (contextState.lastUsedFileContext ? "active" : "good") : "";
+  }
+
+  if (voiceEl) {
+    voiceEl.textContent = `Voice replies: ${voiceRepliesEnabled ? "on" : "off"}`;
+    voiceEl.dataset.state = voiceRepliesEnabled ? "active" : "";
+  }
+
+  if (modeEl) {
+    modeEl.textContent = `Mode: ${contextState.lastMode || "chat"}`;
+    modeEl.dataset.state =
+      contextState.lastMode === "files" || contextState.lastMode === "voice"
+        ? "active"
+        : "";
+  }
+}
+
+/* ---------------------------- UI helpers ------------------------------ */
+function setStatus(text, isError = false) {
+  if (!refs.status) return;
+  refs.status.textContent = text || "";
+  refs.status.dataset.kind = isError ? "error" : "normal";
+}
+
+function setSendingState(flag) {
+  sending = !!flag;
+  if (refs.sendBtn) refs.sendBtn.disabled = sending;
+  if (refs.filesBtn) refs.filesBtn.disabled = sending;
+  if (refs.speakBtn) refs.speakBtn.disabled = sending;
+  if (refs.input) refs.input.disabled = sending;
+}
+
+function scrollChatToBottom() {
+  if (!refs.chatBox) return;
+  const scroller = refs.chatBox.parentElement || refs.chatBox;
+  scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+}
+
+function updateBubbleText(bubbleRef, text) {
+  if (!bubbleRef?.bubble) return;
+  bubbleRef.bubble.textContent = text || "";
+  scrollChatToBottom();
+}
+
 function appendBubble(role, text, { audio } = {}) {
   if (!refs.chatBox) return null;
 
   const wrap = document.createElement("div");
-  wrap.className = `bubble ${role}`;
+  wrap.className = `bubble-wrap ${role}`;
 
-  const msg = document.createElement("div");
-  msg.className = "bubble-text";
-  msg.textContent = text || "";
-  wrap.appendChild(msg);
+  const bubble = document.createElement("div");
+  bubble.className = `bubble ${role}`;
+  bubble.textContent = text || "";
+
+  wrap.appendChild(bubble);
 
   if (audio?.url) {
     const row = document.createElement("div");
@@ -169,84 +330,87 @@ function appendBubble(role, text, { audio } = {}) {
   }
 
   refs.chatBox.appendChild(wrap);
-  ensureChatScroll();
-  return { wrap, msg };
+  scrollChatToBottom();
+
+  return { wrap, bubble };
 }
 
-// replace an existing bubble's text
-function updateBubbleText(bubbleRef, newText) {
+/* ------------------------- conversation utils ------------------------- */
+function getConversationIdFromUrl() {
+  const url = new URL(window.location.href);
+  return url.searchParams.get("c") || null;
+}
+
+function setConversationIdInUrl(id) {
+  if (!id) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("c", id);
+  window.history.replaceState({}, "", url.toString());
+}
+
+function getDeviceId() {
+  const key = "sow_device_id";
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = crypto?.randomUUID?.() || `dev_${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+
+async function ensureConversation() {
+  if (conversationId) return conversationId;
+
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("No authenticated user");
+
+  const { data, error } = await supabase
+    .from("conversations")
+    .insert([
+      {
+        user_id: userId,
+        title: "New Conversation",
+        summary: null,
+      },
+    ])
+    .select("id, title")
+    .single();
+
+  if (error) throw error;
+
+  conversationId = data?.id || null;
+  contextState.conversationTitle = data?.title || "New conversation";
+  setConversationIdInUrl(conversationId);
+  updateContextStrip();
+
+  return conversationId;
+}
+
+async function refreshConversationTitle() {
+  if (!conversationId) return;
+
   try {
-    if (!bubbleRef?.msg) return;
-    bubbleRef.msg.textContent = newText || "";
-    ensureChatScroll();
+    const { data, error } = await supabase
+      .from("conversations")
+      .select("title, updated_at")
+      .eq("id", conversationId)
+      .single();
+
+    if (error) return;
+
+    contextState.conversationTitle =
+      String(data?.title || "").trim() || "New conversation";
+    contextState.lastUpdatedAt = data?.updated_at || null;
+    updateContextStrip();
   } catch {
     // ignore
   }
 }
 
-/* Add a tiny "Voice replies" toggle below status (no HTML changes required) */
-function ensureVoiceToggle() {
-  if (!refs.status) return;
-  if ($("#voice-toggle")) return;
-
-  const row = document.createElement("div");
-  row.id = "voice-toggle";
-  row.style.display = "flex";
-  row.style.alignItems = "center";
-  row.style.gap = "10px";
-  row.style.marginTop = "10px";
-  row.style.opacity = "0.95";
-
-  const label = document.createElement("label");
-  label.style.display = "flex";
-  label.style.alignItems = "center";
-  label.style.gap = "8px";
-  label.style.cursor = "pointer";
-
-  const cb = document.createElement("input");
-  cb.type = "checkbox";
-  cb.checked = false; // default OFF
-  cb.addEventListener("change", () => {
-    voiceRepliesEnabled = cb.checked;
-  });
-
-  const txt = document.createElement("span");
-  txt.textContent = "Voice replies";
-
-  label.appendChild(cb);
-  label.appendChild(txt);
-  row.appendChild(label);
-
-  refs.status.insertAdjacentElement("afterend", row);
-}
-
-/* ---------------------------- utilities ------------------------------- */
-function setStatus(msg, isError = false) {
-  if (!refs.status) return;
-  refs.status.textContent = msg || "";
-  refs.status.style.color = isError ? "#ffb3b3" : "var(--text-soft)";
-}
-
-function setSendingState(v) {
-  sending = !!v;
-  if (refs.sendBtn) {
-    refs.sendBtn.disabled = sending;
-    refs.sendBtn.textContent = sending ? "Sending…" : "Send";
-  }
-  if (refs.input && !recording) refs.input.disabled = sending;
-  if (refs.filesBtn) refs.filesBtn.disabled = sending;
-  if (refs.speakBtn) refs.speakBtn.disabled = sending && !recording;
-}
-
-function ensureChatScroll() {
-  if (!refs.chatBox) return;
-  const scroller = refs.chatBox.parentElement || refs.chatBox;
-  scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
-}
-
 /* -------------------- load previous messages -------------------- */
 async function loadConversationHistory(convId) {
   if (!convId || !refs.chatBox) return;
+
   try {
     setStatus("Loading conversation…");
 
@@ -268,6 +432,9 @@ async function loadConversationHistory(convId) {
       const bubbleRole = row.role === "assistant" ? "ai" : "user";
       appendBubble(bubbleRole, row.content || "");
     });
+
+    await refreshConversationTitle();
+    setStatus("Ready.");
   } catch (err) {
     console.error("[HOME] loadConversationHistory failed:", err);
     setStatus("Could not load previous messages.", true);
@@ -278,7 +445,14 @@ async function loadConversationHistory(convId) {
 async function coachRequest({ text, source = "chat", wantAudio = false, extra = {} }) {
   if (DEV_DIRECT_OPENAI) {
     const reply = await chatDirectOpenAI(text, extra);
-    return { assistant_text: reply, audio_base64: null, mime: null };
+    return {
+      assistant_text: reply,
+      audio_base64: null,
+      mime: null,
+      usedKnowledge: false,
+      usedFileContext: false,
+      conversationId: conversationId || null,
+    };
   }
 
   const payload = {
@@ -305,10 +479,16 @@ async function coachRequest({ text, source = "chat", wantAudio = false, extra = 
   }
 
   const data = await res.json().catch(() => ({}));
+
   return {
     assistant_text: data.assistant_text ?? data.text ?? data.reply ?? "",
     audio_base64: data.audio_base64 ?? null,
     mime: data.mime ?? data.audio_mime ?? "audio/mpeg",
+    usedKnowledge: !!data.usedKnowledge,
+    usedFileContext: !!data.usedFileContext,
+    conversationId: data.conversationId ?? conversationId ?? null,
+    audio_missing: !!data.audio_missing,
+    audio_error: data.audio_error ?? null,
   };
 }
 
@@ -321,45 +501,123 @@ async function chatDirectOpenAI(text, meta = {}) {
   }
 
   const systemPrompt = meta.system || DEV_SYSTEM_PROMPT;
-  const history = Array.isArray(meta.history) ? meta.history : [];
-  const messages = [
-    { role: "system", content: systemPrompt },
-    ...history.map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: text },
-  ];
-
-  const body = { model: DEV_OPENAI_MODEL, messages, temperature: 0.7 };
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: DEV_OPENAI_MODEL,
+      temperature: 0.7,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: String(text || "").trim() },
+      ],
+    }),
   });
 
   if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`OpenAI ${res.status}: ${errText || "Request failed"}`);
+    const t = await res.text().catch(() => "");
+    throw new Error(`OpenAI ${res.status}: ${t || res.statusText}`);
   }
 
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
   return data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-/* ---------------------- multipart transcription ---------------------- */
-async function transcribeAudioBlobMultipart(blob, mime) {
-  const ext =
-    mime?.includes("ogg") ? "ogg" :
-    mime?.includes("mp4") ? "m4a" :
-    mime?.includes("mpeg") ? "mp3" :
-    mime?.includes("webm") ? "webm" : "webm";
+/* ------------------------ speak / transcription ----------------------- */
+function detectRecordingMime() {
+  const candidates = [
+    { mime: "audio/webm;codecs=opus", ext: "webm" },
+    { mime: "audio/webm", ext: "webm" },
+    { mime: "audio/mp4", ext: "m4a" },
+    { mime: "audio/ogg;codecs=opus", ext: "ogg" },
+  ];
 
-  const filename = `audio.${ext}`;
+  for (const c of candidates) {
+    if (window.MediaRecorder?.isTypeSupported?.(c.mime)) return c;
+  }
+
+  return { mime: "", ext: "webm" };
+}
+
+async function ensureMicStream() {
+  if (mediaStream) return mediaStream;
+
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+
+  return mediaStream;
+}
+
+async function startRecording() {
+  if (recording) return;
+
+  await unlockAudioSystem();
+  await ensureMicStream();
+
+  chosenMime = detectRecordingMime();
+  mediaChunks = [];
+
+  mediaRecorder = new MediaRecorder(
+    mediaStream,
+    chosenMime.mime ? { mimeType: chosenMime.mime } : undefined
+  );
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data?.size > 0) mediaChunks.push(e.data);
+  };
+
+  mediaRecorder.start();
+  recording = true;
+
+  refs.speakBtn?.classList.add("recording");
+  refs.speakBtn && (refs.speakBtn.textContent = "Stop");
+  setStatus("Recording…");
+}
+
+async function stopRecording() {
+  if (!recording || !mediaRecorder) return null;
+
+  return new Promise((resolve) => {
+    mediaRecorder.onstop = async () => {
+      recording = false;
+      refs.speakBtn?.classList.remove("recording");
+      refs.speakBtn && (refs.speakBtn.textContent = "Speak");
+
+      const blob = new Blob(mediaChunks, {
+        type: chosenMime.mime || "audio/webm",
+      });
+
+      mediaChunks = [];
+      resolve(blob);
+    };
+
+    try {
+      mediaRecorder.stop();
+    } catch {
+      recording = false;
+      refs.speakBtn?.classList.remove("recording");
+      refs.speakBtn && (refs.speakBtn.textContent = "Speak");
+      resolve(null);
+    }
+  });
+}
+
+async function transcribeAudio(blob) {
+  if (!blob) return "";
 
   const fd = new FormData();
-  fd.append("audio", blob, filename);
+  fd.append("audio", blob, `user.${chosenMime.ext || "webm"}`);
+  fd.append("model", "gpt-4o-mini-transcribe");
+  fd.append("response_format", "json");
 
   const res = await fetch(TRANSCRIBE_URL, {
     method: "POST",
@@ -372,229 +630,26 @@ async function transcribeAudioBlobMultipart(blob, mime) {
   }
 
   const data = await res.json().catch(() => ({}));
-  return String(data.text || "").trim();
+  return String(data?.text || data?.transcript || "").trim();
 }
 
-/* ------------------------------ actions ------------------------------- */
-async function handleSend() {
-  if (!refs.input) return;
-  const text = refs.input.value.trim();
-  if (!text || sending) return;
-
-  await unlockAudioSystem();
-
-  appendBubble("user", text);
-  setSendingState(true);
-  setStatus("Thinking…");
-
-  let audioUrlToRevoke = null;
-
-  try {
-    const wantAudio = !!voiceRepliesEnabled;
-    const { assistant_text, audio_base64, mime } = await coachRequest({
-      text,
-      source: wantAudio ? "voice" : "chat",
-      wantAudio,
-      extra: {
-        email: session?.user?.email ?? null,
-        page: "home",
-        input_mode: "typed",
-        timestamp: new Date().toISOString(),
-      },
-    });
-
-    let audio = null;
-    if (audio_base64 && wantAudio) {
-      const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
-      audio = { url, mime };
-      audioUrlToRevoke = url;
-    }
-
-    appendBubble("ai", assistant_text || "…", { audio });
-
-    if (audio?.url && wantAudio) {
-      await playAudioUrl(audio.url);
-    }
-
-    setStatus("Ready.");
-  } catch (err) {
-    console.error("[HOME] chat error:", err);
-    appendBubble("ai", "Sorry — something went wrong while replying.");
-    setStatus("Request failed. Please try again.", true);
-  } finally {
-    setSendingState(false);
-    refs.input.value = "";
-    refs.input.focus();
-
-    if (audioUrlToRevoke) {
-      setTimeout(() => {
-        try {
-          URL.revokeObjectURL(audioUrlToRevoke);
-        } catch {}
-      }, 60_000);
-    }
-  }
-}
-
-/* -------------------------- SPEAK (record -> transcribe -> AI voice) ---------------------------- */
-function pickSupportedMime() {
-  const candidates = [
-    { mime: "audio/webm;codecs=opus", ext: "webm" },
-    { mime: "audio/webm", ext: "webm" },
-    { mime: "audio/ogg;codecs=opus", ext: "ogg" },
-    { mime: "audio/mp4", ext: "m4a" },
-    { mime: "audio/mpeg", ext: "mp3" },
-  ];
-  for (const c of candidates) {
-    if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(c.mime)) return c;
-  }
-  return { mime: "audio/webm", ext: "webm" };
-}
-
-async function startRecording() {
-  if (sending) return;
-
-  if (!navigator.mediaDevices?.getUserMedia) {
-    setStatus("Mic not supported in this browser.", true);
-    return;
-  }
-
-  await unlockAudioSystem();
-
-  try {
-    chosenMime = pickSupportedMime();
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(mediaStream, { mimeType: chosenMime.mime });
-    mediaChunks = [];
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) mediaChunks.push(e.data);
-    };
-
-    mediaRecorder.onstop = async () => {
-      let audioUrlToRevoke = null;
-
-      const interimBubble = appendBubble("user", "Transcribing…");
-
-      try {
-        setSendingState(true);
-        setStatus("Transcribing…");
-
-        const blob = new Blob(mediaChunks, { type: chosenMime.mime });
-
-        try {
-          mediaStream?.getTracks()?.forEach((t) => t.stop());
-        } catch {}
-        mediaStream = null;
-
-        mediaRecorder = null;
-        mediaChunks = [];
-
-        const transcriptText = await transcribeAudioBlobMultipart(blob, chosenMime.mime);
-
-        if (!transcriptText) {
-          updateBubbleText(interimBubble, "No speech detected.");
-          setStatus("No speech detected. Try again.", true);
-          return;
-        }
-
-        updateBubbleText(interimBubble, transcriptText);
-
-        setStatus("Thinking…");
-        const { assistant_text, audio_base64, mime } = await coachRequest({
-          text: transcriptText,
-          source: "voice",
-          wantAudio: true,
-          extra: {
-            email: session?.user?.email ?? null,
-            page: "home",
-            input_mode: "speak",
-            timestamp: new Date().toISOString(),
-          },
-        });
-
-        let audio = null;
-        if (audio_base64) {
-          const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
-          audio = { url, mime };
-          audioUrlToRevoke = url;
-        }
-
-        appendBubble("ai", assistant_text || "…", { audio });
-
-        if (audio?.url) {
-          await playAudioUrl(audio.url);
-        }
-
-        setStatus("Ready.");
-      } catch (err) {
-        console.error("[HOME] speak flow error:", err);
-        updateBubbleText(interimBubble, "Transcription failed.");
-        appendBubble("ai", "Sorry — I couldn’t process that. Try again.");
-        setStatus("Speak failed. Please try again.", true);
-      } finally {
-        setSendingState(false);
-
-        if (audioUrlToRevoke) {
-          setTimeout(() => {
-            try {
-              URL.revokeObjectURL(audioUrlToRevoke);
-            } catch {}
-          }, 60_000);
-        }
-      }
-    };
-
-    mediaRecorder.start();
-    recording = true;
-    refs.speakBtn?.classList.add("recording");
-    if (refs.speakBtn) refs.speakBtn.textContent = "Stop";
-    refs.input?.setAttribute("disabled", "true");
-    setStatus("Recording… tap Speak again to stop.");
-  } catch (err) {
-    console.error("startRecording error:", err);
-    setStatus("Microphone access failed.", true);
-  }
-}
-
-function stopRecording() {
-  if (!mediaRecorder) return;
-  try {
-    mediaRecorder.stop();
-  } catch {}
-  recording = false;
-  refs.speakBtn?.classList.remove("recording");
-  if (refs.speakBtn) refs.speakBtn.textContent = "Speak";
-  refs.input?.removeAttribute("disabled");
-  setStatus("Processing audio…");
-}
-
-/* -------------------------- FILES (upload -> extract -> AI + index) -------------------------- */
-
-// Lazy-create a hidden file input (no HTML changes)
-let fileInputEl = null;
-function ensureFilePicker() {
-  if (fileInputEl) return fileInputEl;
-
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = ".pdf,.txt,text/plain,application/pdf";
-  input.style.display = "none";
-  document.body.appendChild(input);
-
-  fileInputEl = input;
-  return fileInputEl;
-}
-
+/* ----------------------------- files flow ----------------------------- */
 function pickFileOnce() {
   return new Promise((resolve) => {
-    const input = ensureFilePicker();
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".pdf,.txt,text/plain,application/pdf";
+    input.style.display = "none";
+    document.body.appendChild(input);
+
     input.value = "";
     const onChange = () => {
       input.removeEventListener("change", onChange);
       const f = input.files?.[0] || null;
+      input.remove();
       resolve(f);
     };
+
     input.addEventListener("change", onChange, { once: true });
     input.click();
   });
@@ -603,7 +658,6 @@ function pickFileOnce() {
 async function uploadFileToStorage(file) {
   const fd = new FormData();
   fd.append("file", file);
-
   fd.append("user_id", session?.user?.id || session?.user?.email || "anon");
   fd.append("conversation_id", conversationId || "");
   fd.append("device_id", localStorage.getItem("sow_device_id") || "");
@@ -611,10 +665,12 @@ async function uploadFileToStorage(file) {
   fd.append("timestamp", new Date().toISOString());
 
   const res = await fetch(UPLOAD_URL, { method: "POST", body: fd });
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`Upload ${res.status}: ${t || res.statusText}`);
   }
+
   return await res.json().catch(() => ({}));
 }
 
@@ -627,7 +683,7 @@ async function extractFileText(file) {
     const t = await res.text().catch(() => "");
     throw new Error(`Extract ${res.status}: ${t || res.statusText}`);
   }
-  return await res.json().catch(() => ({})); // { text, fileName, mime, pages, chars }
+  return await res.json().catch(() => ({}));
 }
 
 function buildFilePrompt({ fileName, text, pages }) {
@@ -640,7 +696,7 @@ You received an uploaded file: "${safeName}"${pageNote}.
 Do these:
 1) Give a concise summary (5-10 bullets).
 2) Pull out key takeaways and action items.
-3) If it's a contract/policy/plan, list risks + missing info.
+3) If it's a contract, policy, or plan, list risks and missing info.
 4) End with 3 questions to ask the user next.
 
 File text:
@@ -648,7 +704,6 @@ ${text}
 `.trim();
 }
 
-// Indexing call (store doc + chunks + embeddings)
 async function processUploadIndex(meta) {
   const payload = {
     storage_path: meta.storage_path || meta.path || meta.storagePath || "",
@@ -674,18 +729,37 @@ async function processUploadIndex(meta) {
   return await res.json().catch(() => ({}));
 }
 
+function addArtifact(meta) {
+  const cleanName = String(meta?.filename || meta?.fileName || "").trim();
+  if (!cleanName) return;
+
+  const exists = contextState.attachedArtifacts.some(
+    (a) => a.filename === cleanName
+  );
+  if (exists) return;
+
+  contextState.attachedArtifacts.push({
+    filename: cleanName,
+    content_type: meta?.content_type || meta?.mime || null,
+    bytes: meta?.bytes || meta?.size || null,
+  });
+
+  updateContextStrip();
+}
+
 async function handleFilesClick() {
   if (sending) return;
 
   await unlockAudioSystem();
+  await ensureConversation();
 
   const file = await pickFileOnce();
   if (!file) return;
 
-  // Show a user bubble for the file
-  appendBubble("user", `Uploaded: ${file.name}`);
+  contextState.lastMode = "files";
+  updateContextStrip();
 
-  // Interim AI bubble
+  appendBubble("user", `Uploaded: ${file.name}`);
   const aiBubble = appendBubble("ai", "Uploading your file…");
 
   setSendingState(true);
@@ -694,12 +768,18 @@ async function handleFilesClick() {
   let audioUrlToRevoke = null;
 
   try {
-    // 1) Upload to storage
     updateBubbleText(aiBubble, "Uploading…");
     const uploaded = await uploadFileToStorage(file);
 
-    // 2) Kick off indexing in background (does NOT block summary)
-    //    If it fails, we log it, but user still gets summary.
+    addArtifact({
+      filename: uploaded.filename || file.name,
+      content_type: uploaded.content_type || file.type,
+      bytes: uploaded.bytes || file.size,
+    });
+
+    contextState.fileIndexingInFlight = true;
+    updateContextStrip();
+
     (async () => {
       try {
         await processUploadIndex({
@@ -712,10 +792,12 @@ async function handleFilesClick() {
         console.log("[HOME] process-upload OK");
       } catch (e) {
         console.warn("[HOME] process-upload failed (non-blocking):", e);
+      } finally {
+        contextState.fileIndexingInFlight = false;
+        updateContextStrip();
       }
     })();
 
-    // 3) Extract text now for immediate AI summary
     updateBubbleText(aiBubble, "Reading text…");
     const extracted = await extractFileText(file);
     const text = String(extracted?.text || "").trim();
@@ -726,7 +808,6 @@ async function handleFilesClick() {
       return;
     }
 
-    // 4) Summarize with coach
     updateBubbleText(aiBubble, "Summarizing…");
 
     const wantAudio = !!voiceRepliesEnabled;
@@ -736,7 +817,7 @@ async function handleFilesClick() {
       pages: extracted?.pages || null,
     });
 
-    const { assistant_text, audio_base64, mime } = await coachRequest({
+    const res = await coachRequest({
       text: prompt,
       source: wantAudio ? "voice" : "chat",
       wantAudio,
@@ -752,11 +833,15 @@ async function handleFilesClick() {
       },
     });
 
-    updateBubbleText(aiBubble, assistant_text || "…");
+    contextState.lastUsedKnowledge = !!res.usedKnowledge;
+    contextState.lastUsedFileContext = !!res.usedFileContext;
+    contextState.lastMode = "files";
+    updateContextStrip();
 
-    // Optional voice
-    if (audio_base64 && wantAudio) {
-      const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
+    updateBubbleText(aiBubble, res.assistant_text || "…");
+
+    if (res.audio_base64 && wantAudio) {
+      const { url } = base64ToBlobUrl(res.audio_base64, res.mime || "audio/mpeg");
       audioUrlToRevoke = url;
 
       const audioRow = document.createElement("div");
@@ -777,6 +862,7 @@ async function handleFilesClick() {
       await playAudioUrl(url);
     }
 
+    await refreshConversationTitle();
     setStatus("Ready.");
   } catch (err) {
     console.error("[HOME] file flow error:", err);
@@ -784,154 +870,154 @@ async function handleFilesClick() {
     setStatus("File processing failed. Try again.", true);
   } finally {
     setSendingState(false);
-    refs.input?.focus?.();
-
     if (audioUrlToRevoke) {
-      setTimeout(() => {
-        try {
-          URL.revokeObjectURL(audioUrlToRevoke);
-        } catch {}
-      }, 60_000);
+      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 60_000);
     }
   }
 }
 
-/* -------------------------- tooltips (guides) -------------------------- */
-function isTouchLike() {
-  return (
-    window.matchMedia?.("(hover: none)").matches ||
-    "ontouchstart" in window ||
-    navigator.maxTouchPoints > 0
-  );
+/* ---------------------------- main chat send -------------------------- */
+async function sendCurrentInput() {
+  if (sending) return;
+
+  const text = String(refs.input?.value || "").trim();
+  if (!text) return;
+
+  await unlockAudioSystem();
+  await ensureConversation();
+
+  refs.input.value = "";
+  appendBubble("user", text);
+
+  const aiBubble = appendBubble("ai", "Thinking…");
+  setSendingState(true);
+  setStatus("Thinking…");
+
+  let audioUrlToRevoke = null;
+
+  try {
+    const wantAudio = !!voiceRepliesEnabled;
+
+    const res = await coachRequest({
+      text,
+      source: wantAudio ? "voice" : "chat",
+      wantAudio,
+      extra: {
+        email: session?.user?.email ?? null,
+        page: "home",
+        input_mode: "text",
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    contextState.lastUsedKnowledge = !!res.usedKnowledge;
+    contextState.lastUsedFileContext = !!res.usedFileContext;
+    contextState.lastMode = wantAudio ? "voice" : "chat";
+
+    if (res.conversationId && !conversationId) {
+      conversationId = res.conversationId;
+      setConversationIdInUrl(conversationId);
+    }
+
+    updateContextStrip();
+    updateBubbleText(aiBubble, res.assistant_text || "…");
+
+    if (res.audio_base64 && wantAudio) {
+      const { url } = base64ToBlobUrl(res.audio_base64, res.mime || "audio/mpeg");
+      audioUrlToRevoke = url;
+
+      const audioRow = document.createElement("div");
+      audioRow.className = "bubble-audio-row";
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "bubble-audio-btn";
+      btn.textContent = "Play voice";
+      btn.addEventListener("click", async () => {
+        await unlockAudioSystem();
+        await playAudioUrl(url);
+      });
+
+      audioRow.appendChild(btn);
+      aiBubble?.wrap?.appendChild(audioRow);
+
+      await playAudioUrl(url);
+    }
+
+    await refreshConversationTitle();
+    setStatus("Ready.");
+  } catch (err) {
+    console.error("[HOME] sendCurrentInput error:", err);
+    updateBubbleText(aiBubble, "Sorry — something went wrong.");
+    setStatus("Request failed. Try again.", true);
+  } finally {
+    setSendingState(false);
+    if (audioUrlToRevoke) {
+      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 60_000);
+    }
+  }
 }
 
-function initTooltips() {
-  const targets = Array.from(document.querySelectorAll("[data-tt-title]"));
-  if (!targets.length) return;
+/* ------------------------------ speak flow ---------------------------- */
+async function handleSpeakClick() {
+  await unlockAudioSystem();
 
-  const tt = document.createElement("div");
-  tt.className = "sow-tooltip";
-  tt.innerHTML = `<div class="tt-title"></div><div class="tt-body"></div>`;
-  document.body.appendChild(tt);
-
-  const setContent = (el) => {
-    tt.querySelector(".tt-title").textContent = el.getAttribute("data-tt-title") || "";
-    tt.querySelector(".tt-body").textContent = el.getAttribute("data-tt-body") || "";
-  };
-
-  const position = (el) => {
-    const r = el.getBoundingClientRect();
-
-    tt.classList.add("show");
-    const tr = tt.getBoundingClientRect();
-
-    const preferAbove = r.top > tr.height + 18;
-
-    let top = preferAbove ? r.top - tr.height - 12 : r.bottom + 12;
-    let left = r.left + r.width / 2 - tr.width / 2;
-
-    left = Math.max(12, Math.min(left, window.innerWidth - tr.width - 12));
-    top = Math.max(12, Math.min(top, window.innerHeight - tr.height - 12));
-
-    tt.style.left = `${left}px`;
-    tt.style.top = `${top}px`;
-
-    const centerX = r.left + r.width / 2;
-    const arrowX = Math.max(14, Math.min(centerX - left, tr.width - 14));
-
-    tt.style.setProperty("--arrow-left", `${arrowX - 5}px`);
-    if (preferAbove) {
-      tt.style.setProperty("--arrow-top", `${tr.height - 4}px`);
-      tt.style.setProperty("--arrow-rot", "225deg");
-    } else {
-      tt.style.setProperty("--arrow-top", `-6px`);
-      tt.style.setProperty("--arrow-rot", "45deg");
+  if (!recording) {
+    try {
+      await startRecording();
+    } catch (err) {
+      console.error("[HOME] startRecording error:", err);
+      setStatus("Mic permission denied or unavailable.", true);
     }
-  };
-
-  let showTimer = null;
-  let hideTimer = null;
-
-  const show = (el) => {
-    setContent(el);
-    position(el);
-  };
-
-  const hide = () => {
-    tt.classList.remove("show");
-  };
-
-  if (!isTouchLike()) {
-    targets.forEach((el) => {
-      el.addEventListener("mouseenter", () => {
-        clearTimeout(hideTimer);
-        clearTimeout(showTimer);
-        showTimer = setTimeout(() => show(el), 250);
-      });
-      el.addEventListener("mouseleave", () => {
-        clearTimeout(showTimer);
-        hideTimer = setTimeout(hide, 80);
-      });
-      el.addEventListener("focus", () => show(el));
-      el.addEventListener("blur", hide);
-    });
-  } else {
-    targets.forEach((el) => {
-      let pressTimer = null;
-
-      el.addEventListener(
-        "touchstart",
-        () => {
-          clearTimeout(pressTimer);
-          pressTimer = setTimeout(() => show(el), 550);
-        },
-        { passive: true }
-      );
-
-      el.addEventListener(
-        "touchend",
-        () => {
-          clearTimeout(pressTimer);
-          hide();
-        },
-        { passive: true }
-      );
-
-      el.addEventListener(
-        "touchmove",
-        () => {
-          clearTimeout(pressTimer);
-          hide();
-        },
-        { passive: true }
-      );
-    });
+    return;
   }
 
-  window.addEventListener("scroll", hide, { passive: true });
-  window.addEventListener("resize", hide);
+  try {
+    const blob = await stopRecording();
+    if (!blob) {
+      setStatus("No audio captured.", true);
+      return;
+    }
+
+    setStatus("Transcribing…");
+    const text = await transcribeAudio(blob);
+
+    if (!text) {
+      setStatus("I couldn’t hear anything clear.", true);
+      return;
+    }
+
+    refs.input.value = text;
+    await sendCurrentInput();
+  } catch (err) {
+    console.error("[HOME] handleSpeakClick error:", err);
+    setStatus("Voice input failed. Try again.", true);
+  }
 }
 
-/* ------------------------------ bindings ------------------------------ */
+/* ---------------------------- auth / boot ----------------------------- */
+async function handleLogout() {
+  try {
+    await supabase.auth.signOut();
+  } catch (err) {
+    console.warn("[HOME] signOut warning:", err);
+  } finally {
+    window.location.href = "auth.html";
+  }
+}
+
 function bindUI() {
-  refs.chips.forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const fill = chip.getAttribute("data-fill") || chip.textContent || "";
-      if (refs.input) {
-        refs.input.value = fill;
-        refs.input.focus();
-      }
-    });
-  });
+  refs.sendBtn?.addEventListener("click", sendCurrentInput);
 
-  refs.sendBtn?.addEventListener("click", handleSend);
-
-  refs.input?.addEventListener("keydown", (e) => {
+  refs.input?.addEventListener("keydown", async (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      await sendCurrentInput();
     }
   });
+
+  refs.filesBtn?.addEventListener("click", handleFilesClick);
+  refs.speakBtn?.addEventListener("click", handleSpeakClick);
 
   refs.callBtn?.addEventListener("click", () => {
     const url = new URL("call.html", window.location.origin);
@@ -939,93 +1025,64 @@ function bindUI() {
     window.location.href = url.toString();
   });
 
-  refs.filesBtn?.addEventListener("click", handleFilesClick);
-
-  refs.speakBtn?.addEventListener("click", async () => {
-    if (sending) return;
-    if (!recording) await startRecording();
-    else stopRecording();
-  });
+  refs.logoutBtn?.addEventListener("click", handleLogout);
 
   refs.hamburger?.addEventListener("click", () => {
     const url = new URL("history.html", window.location.origin);
     if (conversationId) url.searchParams.set("c", conversationId);
-    url.searchParams.set("returnTo", encodeURIComponent("home.html"));
     window.location.href = url.toString();
   });
 
-  refs.logoutBtn?.addEventListener("click", async () => {
-    try {
-      await supabase.auth.signOut();
-    } catch (e) {
-      console.warn("signOut error:", e);
-    } finally {
-      window.location.replace("/auth.html");
-    }
+  refs.chips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const fill = chip.getAttribute("data-fill") || chip.textContent || "";
+      if (refs.input) refs.input.value = String(fill).trim();
+      refs.input?.focus();
+    });
+  });
+
+  refs.input?.addEventListener("focus", () => unlockAudioSystem().catch(() => {}));
+
+  // Double-click the Speak button to toggle voice replies on/off.
+  refs.speakBtn?.addEventListener("dblclick", () => {
+    voiceRepliesEnabled = !voiceRepliesEnabled;
+    contextState.lastMode = voiceRepliesEnabled ? "voice" : "chat";
+    updateContextStrip();
+    setStatus(
+      voiceRepliesEnabled ? "Voice replies enabled." : "Voice replies disabled."
+    );
   });
 }
 
-/* ---------------------- conversation wiring --------------------------- */
-async function ensureConversationForUser(user) {
-  const url = new URL(window.location.href);
-  const params = url.searchParams;
-  const existingId = params.get("c");
-  const forceNew = params.get("new") === "1";
+async function boot() {
+  try {
+    ensureContextStrip();
+    updateContextStrip();
 
-  if (existingId && !forceNew) {
-    const { data, error } = await supabase
-      .from("conversations")
-      .select("id")
-      .eq("id", existingId)
-      .eq("user_id", user.id)
-      .maybeSingle();
+    await ensureAuthedOrRedirect();
+    session = await getSession();
 
-    if (!error && data && data.id) return data.id;
+    if (!session?.user) {
+      window.location.href = "auth.html";
+      return;
+    }
+
+    conversationId = getConversationIdFromUrl();
+
+    bindUI();
+
+    if (conversationId) {
+      await loadConversationHistory(conversationId);
+    } else {
+      setStatus("Signed in. How can I help?");
+    }
+
+    await refreshConversationTitle();
+    updateContextStrip();
+  } catch (err) {
+    console.error("[HOME] boot error:", err);
+    setStatus("Could not load the page.", true);
   }
-
-  const { data, error } = await supabase
-    .from("conversations")
-    .insert({ user_id: user.id, title: "New Conversation" })
-    .select("id")
-    .single();
-
-  if (error || !data?.id) {
-    console.error("[HOME] Failed to create conversation:", error);
-    throw new Error("Could not create conversation");
-  }
-
-  const newId = data.id;
-  params.set("c", newId);
-  params.delete("new");
-  url.search = params.toString();
-  window.history.replaceState({}, "", url.toString());
-  return newId;
 }
 
-/* -------------------------------- boot -------------------------------- */
-(async function boot() {
-  await ensureAuthedOrRedirect();
-  session = await getSession();
-
-  if (!session?.user) {
-    setStatus("No user session found.", true);
-    return;
-  }
-
-  try {
-    conversationId = await ensureConversationForUser(session.user);
-    await loadConversationHistory(conversationId);
-  } catch (e) {
-    console.error("[HOME] conversation init error:", e);
-    setStatus("Could not create conversation. Please refresh.", true);
-  }
-
-  bindUI();
-  initTooltips();
-  ensureVoiceToggle();
-  ensureSharedAudio();
-
-  if (refs.hamburger) refs.hamburger.style.display = "";
-
-  setStatus("Signed in. How can I help?");
-})();
+boot();
