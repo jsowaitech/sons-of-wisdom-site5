@@ -21,7 +21,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
-import extractTextFromBuffer from "./lib/extract-text.js";
+import { extractTextFromBuffer } from "./lib/extract-text.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -110,7 +110,9 @@ async function createEmbedding(input) {
 
 async function insertChunksBatch(rows) {
   if (!rows.length) return;
-  const { error } = await supabase.from("conversation_document_chunks").insert(rows);
+  const { error } = await supabase
+    .from("conversation_document_chunks")
+    .insert(rows);
   if (error) throw error;
 }
 
@@ -214,8 +216,12 @@ export const handler = async (event) => {
 
     const buffer = Buffer.from(await fileData.arrayBuffer());
 
-    // 2) Extract text using your shared lib (prevents DOMMatrix errors)
-    const extracted = await extractTextFromBuffer(buffer, filename, content_type);
+    // 2) Extract text using shared lib
+    const extracted = await extractTextFromBuffer(
+      buffer,
+      filename,
+      content_type
+    );
 
     if (extracted.kind === "unsupported") {
       return {
@@ -254,7 +260,8 @@ export const handler = async (event) => {
         storage_bucket: bucket,
         storage_path,
         filename: filename || "upload",
-        content_type: content_type || (allowPdf ? "application/pdf" : "text/plain"),
+        content_type:
+          content_type || (allowPdf ? "application/pdf" : "text/plain"),
         bytes: typeof body.bytes === "number" ? body.bytes : buffer.length,
       })
       .select()
@@ -273,7 +280,7 @@ export const handler = async (event) => {
     let created = 0;
 
     for (let i = 0; i < chunks.length; i++) {
-      // ✅ Force string + safe trim so "chunk.trim is not a function" never happens
+      // Force string + safe trim
       const chunk = String(chunks[i] || "").trim();
       if (!chunk) continue;
 
