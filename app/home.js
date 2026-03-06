@@ -3,6 +3,7 @@
 // Unified with backend context pipeline metadata:
 // - surfaces usedKnowledge / usedFileContext
 // - injects a lightweight context strip above chat
+// - hydrates conversation title + existing artifacts from Supabase
 // - keeps chat, speak, file upload, history, and optional voice replies
 
 sessionStorage.removeItem("sow_redirected");
@@ -396,15 +397,51 @@ async function refreshConversationTitle() {
       .eq("id", conversationId)
       .single();
 
-    if (error) return;
+    if (error) {
+      console.warn("[HOME] refreshConversationTitle error:", error);
+      return;
+    }
 
     contextState.conversationTitle =
       String(data?.title || "").trim() || "New conversation";
     contextState.lastUpdatedAt = data?.updated_at || null;
     updateContextStrip();
-  } catch {
-    // ignore
+  } catch (err) {
+    console.warn("[HOME] refreshConversationTitle failed:", err);
   }
+}
+
+async function hydrateConversationArtifacts() {
+  if (!conversationId) return;
+
+  try {
+    const { data, error } = await supabase
+      .from("conversation_documents")
+      .select("filename, content_type, bytes, created_at")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.warn("[HOME] hydrateConversationArtifacts error:", error);
+      return;
+    }
+
+    contextState.attachedArtifacts = (data || []).map((row) => ({
+      filename: row.filename || "file",
+      content_type: row.content_type || null,
+      bytes: row.bytes || null,
+      created_at: row.created_at || null,
+    }));
+
+    updateContextStrip();
+  } catch (err) {
+    console.warn("[HOME] hydrateConversationArtifacts failed:", err);
+  }
+}
+
+async function hydrateConversationMeta() {
+  await refreshConversationTitle();
+  await hydrateConversationArtifacts();
 }
 
 /* -------------------- load previous messages -------------------- */
@@ -433,7 +470,7 @@ async function loadConversationHistory(convId) {
       appendBubble(bubbleRole, row.content || "");
     });
 
-    await refreshConversationTitle();
+    await hydrateConversationMeta();
     setStatus("Ready.");
   } catch (err) {
     console.error("[HOME] loadConversationHistory failed:", err);
@@ -794,6 +831,7 @@ async function handleFilesClick() {
         console.warn("[HOME] process-upload failed (non-blocking):", e);
       } finally {
         contextState.fileIndexingInFlight = false;
+        await hydrateConversationArtifacts();
         updateContextStrip();
       }
     })();
@@ -862,7 +900,7 @@ async function handleFilesClick() {
       await playAudioUrl(url);
     }
 
-    await refreshConversationTitle();
+    await hydrateConversationMeta();
     setStatus("Ready.");
   } catch (err) {
     console.error("[HOME] file flow error:", err);
@@ -944,7 +982,7 @@ async function sendCurrentInput() {
       await playAudioUrl(url);
     }
 
-    await refreshConversationTitle();
+    await hydrateConversationMeta();
     setStatus("Ready.");
   } catch (err) {
     console.error("[HOME] sendCurrentInput error:", err);
@@ -1077,7 +1115,7 @@ async function boot() {
       setStatus("Signed in. How can I help?");
     }
 
-    await refreshConversationTitle();
+    await hydrateConversationMeta();
     updateContextStrip();
   } catch (err) {
     console.error("[HOME] boot error:", err);
