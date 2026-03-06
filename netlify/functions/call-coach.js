@@ -29,6 +29,9 @@
 // NEW (UNIFIED CONTEXT PIPELINE):
 // ✅ Uses shared buildUnifiedContext() for KB + memory + uploaded-file context
 // ✅ Keeps call mode aligned with chat mode context orchestration
+//
+// NEW (TITLE FIX):
+// ✅ Updates conversation title from first real user message when title is still "New Conversation"
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
@@ -717,7 +720,6 @@ function safeJsonParse(s, fallback = {}) {
   }
 }
 
-// Keep output TTS-safe + bounded
 function clampTtsSafe(text, maxChars = 1200) {
   let s = String(text || "");
 
@@ -736,6 +738,14 @@ function clampTtsSafe(text, maxChars = 1200) {
 
   const cut = s.slice(0, maxChars - 1).trim();
   return cut + "…";
+}
+
+function makeConversationTitleFromText(text, maxLen = 80) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "New Conversation";
+  let t = clean;
+  if (t.length > maxLen) t = t.slice(0, maxLen - 1) + "…";
+  return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
 // ---------- OpenAI helpers ----------
@@ -970,6 +980,30 @@ async function insertConversationMessages(
     headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
     query: { id: `eq.${conversationId}` },
     body: JSON.stringify({ updated_at: nowIso, last_updated_at: nowIso }),
+  });
+}
+
+async function maybeUpdateConversationTitle(conversation, conversationId, firstUserMessage) {
+  if (!conversation || !conversationId || !firstUserMessage) return;
+
+  const current = String(conversation.title || "").trim();
+  if (current && current !== "New Conversation") return;
+
+  const nowIso = new Date().toISOString();
+  const newTitle = makeConversationTitleFromText(firstUserMessage);
+
+  await supaFetch("conversations", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    query: { id: `eq.${conversationId}` },
+    body: JSON.stringify({
+      title: newTitle,
+      updated_at: nowIso,
+      last_updated_at: nowIso,
+    }),
   });
 }
 
@@ -1244,6 +1278,14 @@ Use this context to stay consistent. Do not read this back to the user.
               userMessageForAI,
               reply
             );
+
+            if (!recentMessages.length) {
+              await maybeUpdateConversationTitle(
+                conversation,
+                conversationId,
+                userMessageForAI
+              );
+            }
           } catch (e) {
             console.error("[call-coach] conversation logging error:", e);
           }
