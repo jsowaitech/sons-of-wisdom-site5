@@ -1,5 +1,11 @@
 // netlify/functions/openai-transcribe.js
 // Son of Wisdom — OpenAI Transcribe proxy (Netlify Function, Node 18+)
+//
+// FIX:
+// - defaults transcription language to English
+// - accepts optional multipart field: language
+// - returns debug info for language/model when useful
+// - keeps tiny-blob guard and timeout behavior
 
 import Busboy from "busboy";
 
@@ -20,6 +26,34 @@ function normalizeMime(m) {
   }
   if (mime.includes("ogg")) return "audio/ogg";
   return mime || "audio/webm";
+}
+
+function normalizeLanguage(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "en";
+
+  const allowed = new Set([
+    "en",
+    "en-us",
+    "en-gb",
+    "ko",
+    "ja",
+    "es",
+    "fr",
+    "de",
+    "pt",
+    "it",
+    "tl",
+    "fil",
+  ]);
+
+  if (allowed.has(raw)) {
+    if (raw === "en-us" || raw === "en-gb") return "en";
+    if (raw === "fil") return "tl";
+    return raw;
+  }
+
+  return "en";
 }
 
 export const handler = async (event) => {
@@ -77,6 +111,7 @@ export const handler = async (event) => {
     let audioFilename = "audio.webm";
     let audioMime = "audio/webm";
     let gotFileField = "";
+    let requestedLanguage = "en";
 
     bb.on("file", (fieldname, file, info) => {
       if (fieldname !== "audio" && fieldname !== "file") {
@@ -95,6 +130,12 @@ export const handler = async (event) => {
       file.on("end", () => {
         audioBuffer = Buffer.concat(chunks);
       });
+    });
+
+    bb.on("field", (fieldname, value) => {
+      if (fieldname === "language") {
+        requestedLanguage = normalizeLanguage(value);
+      }
     });
 
     const finished = new Promise((resolve, reject) => {
@@ -120,7 +161,6 @@ export const handler = async (event) => {
       };
     }
 
-    // Tiny blob guard
     if (audioBuffer.length < 8000) {
       return {
         statusCode: 200,
@@ -130,11 +170,11 @@ export const handler = async (event) => {
           skipped: true,
           reason: "audio_too_small",
           bytes: audioBuffer.length,
+          language: requestedLanguage,
         }),
       };
     }
 
-    // Normalize MIME for Safari
     audioMime = normalizeMime(audioMime);
 
     const fd = new FormData();
@@ -144,22 +184,21 @@ export const handler = async (event) => {
       audioFilename
     );
     fd.append("model", MODEL);
+    fd.append("language", requestedLanguage);
+    fd.append("response_format", "json");
 
-    const timeout = withTimeout(25000); // ✅ 25s hard limit
+    const timeout = withTimeout(25000);
 
     let resp;
     try {
-      resp = await fetch(
-        "https://api.openai.com/v1/audio/transcriptions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: fd,
-          signal: timeout.signal,
-        }
-      );
+      resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: fd,
+        signal: timeout.signal,
+      });
     } finally {
       timeout.clear();
     }
@@ -173,6 +212,8 @@ export const handler = async (event) => {
           error: "OpenAI transcribe failed",
           details: txt || resp.statusText,
           model: MODEL,
+          language: requestedLanguage,
+          field: gotFileField || null,
         }),
       };
     }
@@ -184,6 +225,8 @@ export const handler = async (event) => {
       headers: jsonHeaders,
       body: JSON.stringify({
         text: data?.text || "",
+        language: requestedLanguage,
+        model: MODEL,
       }),
     };
   } catch (e) {

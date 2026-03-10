@@ -847,6 +847,7 @@ async function transcribeTurn() {
     fd.append("audio", blob, filename);
     fd.append("model", TRANSCRIBE_MODEL);
     fd.append("response_format", "json");
+    fd.append("language", "en");
 
     const resp = await fetch(TRANSCRIBE_ENDPOINT, {
       method: "POST",
