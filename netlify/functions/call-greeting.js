@@ -1,5 +1,5 @@
 // netlify/functions/call-greeting.js
-// Son of Wisdom — Dynamic AI greeting (varied + reliable)
+// Son of Wisdom — Dynamic AI greeting (Codex-aligned + reliable)
 // Returns JSON: { text, assistant_text, audio_base64?, mime, call_id, audio_expected, audio_missing?, audio_error? }
 
 const corsHeaders = {
@@ -8,7 +8,6 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ✅ Always prevent caching (important on edge/CDN layers)
 const noStoreHeaders = {
   ...corsHeaders,
   "Content-Type": "application/json",
@@ -21,7 +20,6 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
-// Supabase (REST) for logging greeting as a turn (best-effort)
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
@@ -32,7 +30,7 @@ const CALL_SESSIONS_TABLE = "call_sessions";
 const CONVERSATION_MESSAGES_TABLE = "conversation_messages";
 const SENTINEL_UUID = "00000000-0000-0000-0000-000000000000";
 
-// --------- Utilities ----------
+/* ---------- Utilities ---------- */
 function safeJsonParse(str) {
   try {
     return JSON.parse(str || "{}");
@@ -73,22 +71,31 @@ function clampPlainText(s, maxChars = 420) {
   return clean.slice(0, maxChars - 1).trim() + "…";
 }
 
-// --------- OpenAI ----------
+function fallbackGreeting() {
+  const options = [
+    "Hey brother. I’m Blake. Take a breath and settle in. I’m here with you, so when you’re ready, tell me what’s been weighing on you.",
+    "Hey, I’m Blake. You don’t have to carry this alone. Take a breath, and when you’re ready, tell me what’s sitting heavy on your heart.",
+    "I’m here with you. I’m Blake. Take a breath and settle in, then tell me what battle you’re walking through right now.",
+  ];
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+/* ---------- OpenAI ---------- */
 async function openaiChat(messages, opts = {}) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
   const body = {
     model: OPENAI_MODEL,
     messages,
-    temperature: opts.temperature ?? 0.9,
-    presence_penalty: opts.presence_penalty ?? 0.6,
-    frequency_penalty: opts.frequency_penalty ?? 0.5,
+    temperature: opts.temperature ?? 0.85,
+    presence_penalty: opts.presence_penalty ?? 0.55,
+    frequency_penalty: opts.frequency_penalty ?? 0.45,
     max_tokens: opts.maxTokens ?? 120,
   };
 
   if (opts.user) body.user = opts.user;
 
-  const to = withTimeout(opts.timeoutMs ?? 20000); // ✅ hard timeout
+  const to = withTimeout(opts.timeoutMs ?? 20000);
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -112,18 +119,28 @@ async function openaiChat(messages, opts = {}) {
   }
 }
 
-// --------- ElevenLabs (optional) ----------
+/* ---------- ElevenLabs ---------- */
 async function elevenLabsTTS(text, opts = {}) {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-    return { audio_base64: null, mime: "audio/mpeg", error: "Missing ELEVENLABS env vars" };
+    return {
+      audio_base64: null,
+      mime: "audio/mpeg",
+      error: "Missing ELEVENLABS env vars",
+    };
   }
 
   const trimmed = String(text || "").trim();
-  if (!trimmed) return { audio_base64: null, mime: "audio/mpeg", error: "Empty greeting text" };
+  if (!trimmed) {
+    return {
+      audio_base64: null,
+      mime: "audio/mpeg",
+      error: "Empty greeting text",
+    };
+  }
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
+  const to = withTimeout(opts.timeoutMs ?? 22000);
 
-  const to = withTimeout(opts.timeoutMs ?? 22000); // ✅ hard timeout
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -150,16 +167,21 @@ async function elevenLabsTTS(text, opts = {}) {
     }
 
     const buf = Buffer.from(await res.arrayBuffer());
-    return { audio_base64: buf.toString("base64"), mime: "audio/mpeg", error: null };
+    return {
+      audio_base64: buf.toString("base64"),
+      mime: "audio/mpeg",
+      error: null,
+    };
   } catch (e) {
-    const msg = e?.name === "AbortError" ? "ElevenLabs timeout" : String(e?.message || e);
+    const msg =
+      e?.name === "AbortError" ? "ElevenLabs timeout" : String(e?.message || e);
     return { audio_base64: null, mime: "audio/mpeg", error: msg };
   } finally {
     to.clear();
   }
 }
 
-// --------- Supabase best-effort logging ----------
+/* ---------- Supabase best-effort logging ---------- */
 async function supabaseInsert(table, rows) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
 
@@ -187,7 +209,7 @@ async function supabaseInsert(table, rows) {
   }
 }
 
-// --------- Handler ----------
+/* ---------- Handler ---------- */
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: noStoreHeaders, body: "" };
@@ -209,32 +231,67 @@ exports.handler = async (event) => {
     const callId = String(body.call_id || body.callId || "").trim() || null;
 
     const conversationId =
-      String(body.conversationId || body.conversation_id || body.c || "").trim() || null;
+      String(body.conversationId || body.conversation_id || body.c || "").trim() ||
+      null;
 
     const seed = randomSeed();
-    const palette = [
+
+    const styles = [
       "warm and grounded",
-      "firm and encouraging",
-      "calm and confident",
-      "direct but compassionate",
-      "steady and brotherly",
+      "steady and fatherly",
+      "calm and strong",
+      "gentle but weighty",
+      "simple and brotherly",
     ];
-    const style = palette[Math.floor(Math.random() * palette.length)];
+    const style = styles[Math.floor(Math.random() * styles.length)];
 
     const system = `
-You are AI Blake, a concise masculine Christian coach for Son of Wisdom.
-Return ONE short spoken greeting (1–2 sentences).
-Tone: ${style}.
-Goal: invite the man to share one concrete situation he is facing right now.
-Rules:
-- Plain text only (no markdown)
+You are AI Blake, the voice coach of Son of Wisdom.
+
+You are not a generic assistant.
+You are a warm, masculine, fatherly presence.
+You speak like a man carrying calm strength, not like a bot, therapist, or customer support rep.
+
+Your job right now is ONLY to give the first spoken greeting for a live voice call.
+
+GOAL
+- Welcome the man into the call
+- Help him settle
+- Sound present, human, and grounded
+- Invite him to share when ready
+
+DO NOT
+- Ask multiple questions
+- Sound preachy
+- Sound like a sermon
+- Sound like a generic assistant
+- Say "How can I help you today?"
+- Say "What challenge are you facing today?"
+- Sound corporate, clinical, or overly polished
+
+GOOD GREETING SHAPE
+- 2 to 4 short sentences
+- Warm opening
+- Brief settling line like take a breath or settle in
+- Reassure him he does not have to carry it alone
+- End with one gentle invitation to share when ready
+
+TONE
+${style}
+
+STYLE RULES
+- Plain text only
+- No markdown
 - No bullet points
-- Keep it short and natural for TTS
-- Avoid repeating the exact same opener every time
+- No emojis
+- Natural spoken English
+- Keep it under 65 words
+- Vary the opening so it does not repeat every time
+- You may say brother sometimes, but not always
 `.trim();
 
     const user = `
-Generate a fresh greeting for call mode.
+Generate the call opening greeting now.
 
 Seed: ${seed}
 User id: ${userIdRaw || "unknown"}
@@ -242,29 +299,37 @@ Device id: ${deviceId || "unknown"}
 Conversation id: ${conversationId || "none"}
 `.trim();
 
-    // 1) Greeting text (fast + bounded)
-    const rawText = await openaiChat(
-      [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      {
-        temperature: 0.95,
-        maxTokens: 90,
-        timeoutMs: 18000,
-        user: deviceId || userIdRaw || "sow",
-        presence_penalty: 0.7,
-        frequency_penalty: 0.7,
-      }
-    );
+    let text = "";
 
-    const text = clampPlainText(rawText, 360);
+    try {
+      const rawText = await openaiChat(
+        [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        {
+          temperature: 0.9,
+          maxTokens: 100,
+          timeoutMs: 18000,
+          user: deviceId || userIdRaw || "sow",
+          presence_penalty: 0.6,
+          frequency_penalty: 0.6,
+        }
+      );
 
-    // 2) TTS (optional; do not fail the greeting if TTS fails)
+      text = clampPlainText(rawText, 360);
+    } catch (e) {
+      console.warn("[call-greeting] OpenAI greeting failed, using fallback:", e);
+      text = fallbackGreeting();
+    }
+
+    if (!text) {
+      text = fallbackGreeting();
+    }
+
     const audio_expected = true;
     const ttsRes = await elevenLabsTTS(text, { timeoutMs: 22000 });
 
-    // 3) Log (best-effort; never blocks response)
     const nowIso = new Date().toISOString();
     const userUuid = pickUuidForHistory(userIdRaw);
 
@@ -292,7 +357,6 @@ Conversation id: ${conversationId || "none"}
       }).catch(() => {});
     }
 
-    // 4) Return (always succeeds)
     const resp = {
       text,
       assistant_text: text,
@@ -317,8 +381,7 @@ Conversation id: ${conversationId || "none"}
   } catch (err) {
     console.error("[call-greeting] error:", err);
 
-    // ✅ Even on error: return a fallback greeting so iOS never hangs forever
-    const fallback = "You’re talking to AI Blake. Tell me one real situation you’re facing right now—what happened?";
+    const fallback = fallbackGreeting();
     return {
       statusCode: 200,
       headers: noStoreHeaders,
