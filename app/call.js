@@ -1,24 +1,12 @@
 // app/call.js
-// Son of Wisdom — Call mode (Phone-call pace + iOS-safe layout + reliable audio queue)
+// Son of Wisdom — Call mode
 //
-// ✅ Includes:
-// - Overlay removed (no “Audio paused / Tap to resume” fullscreen blocker)
-// - Single renderStatus (fix status race)
-// - MIME-correct transcription (MediaRecorder mime -> correct file ext)
-// - Keep TTS queued while speaker muted
-// - Close AudioContexts on endCall (iOS leak prevention)  <-- adjusted: DO NOT close playback AC on iOS
-// - Reset VAD/merge state on background
-// - ✅ FIX: Transcript panel autoscrolls the real scroller (#tsList) so lines keep showing
-// - ✅ FIX: Ring plays TWICE before mic/VAD starts (mic is OFF during ring)  <-- still true: mic stream is prewarmed, but VAD/recording starts after ring
-// - ✅ FIX: Less sensitive VAD (higher thresholds + stronger hysteresis)
-// - ✅ FIX (NEW): iOS-safe ring (uses unlocked shared audio element)
-// - ✅ FIX (NEW): VAD voice-hold before starting recording (prevents noise-trigger loops)
-// - ✅ FIX (NEW): Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
-// - ✅ FIX (NEW): Status correctness during ring + greeting (Ringing… / Greeting… / Listening…)
-// - ✅ FIX (CRITICAL iOS): PRIME mic + audio + AudioContexts inside the SAME user gesture (prevents “stuck connecting”)
-// - ✅ FIX (CRITICAL iOS): Create MediaElementSource ONLY ONCE (prevents InvalidStateError)
-// - ✅ PREMIUM PRESENCE (NEW): “Blake has joined” moment + “Blake speaking…” + soft handoff to Listening
-// - ✅ SECURITY: Hume realtime now uses short-lived backend tokens instead of a browser-exposed API key
+// FIXES ADDED:
+// - speaking state now follows actual audio playback events
+// - backend debug_audio is logged and surfaced in debug HUD
+// - no fake "Blake is speaking" before audio actually starts
+// - better handling when TTS text exists but audio is missing
+// - keeps existing iOS-safe queue / ring / VAD behavior
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -95,7 +83,7 @@ let speechStartTime = 0;
 let humeReady = false;
 let humeActive = false;
 
-/* ✅ require voice hold before start (prevents noise triggers) */
+/* require voice hold before start */
 const VAD_START_HOLD_MS = 140;
 let vadStartCandidateAt = 0;
 
@@ -109,17 +97,17 @@ const VAD_MERGE_WINDOW_MS = 1700;
 const VAD_MIN_SPEECH_MS = 520;
 const VAD_IDLE_TIMEOUT_MS = 30000;
 
-/* ✅ Less sensitive threshold shaping */
+/* threshold shaping */
 const NOISE_FLOOR_UPDATE_MS = 300;
 const THRESHOLD_MULTIPLIER = 2.85;
 const THRESHOLD_MIN = 0.026;
 const THRESHOLD_MAX = 0.11;
 
-/* ✅ Stronger hysteresis (reduces jitter/noise triggers) */
+/* hysteresis */
 const VAD_START_MULT = 1.25;
 const VAD_CONT_MULT = 0.82;
 
-/* Barge-in debouncing (less sensitive) */
+/* Barge-in debouncing */
 const BARGE_MIN_HOLD_MS = 260;
 const BARGE_COOLDOWN_MS = 900;
 const BARGE_EXTRA_MULT = 1.55;
@@ -144,6 +132,7 @@ let playbackEpoch = 0;
 
 /* AI speaking flags */
 let isPlayingAI = false;
+let playerIsActuallyPlaying = false;
 
 /* Abort controllers */
 let transcribeAbort = null;
@@ -177,6 +166,7 @@ let ttsDraining = false;
 
 /* Debug HUD */
 let debugOn = false;
+let lastDebugAudio = null;
 
 /* Status flags */
 let isTranscribing = false;
@@ -185,10 +175,10 @@ let pausedInBackground = false;
 let transientStatus = "";
 let transientUntil = 0;
 
-/* ✅ Call phases */
+/* Call phases */
 let callPhase = "idle"; // idle | requesting_mic | ringing | joined | greeting | live
 
-/* ✅ Premium presence micro-timing */
+/* Premium presence timing */
 const PRESENCE_JOIN_MS = 420;
 const PRESENCE_HANDOFF_MS = 1200;
 
@@ -228,12 +218,12 @@ function renderStatus() {
     return;
   }
   if (callPhase === "greeting") {
-    if (isPlayingAI && !speakerMuted) setStatus("Blake speaking…");
+    if (playerIsActuallyPlaying && !speakerMuted) setStatus("Blake speaking…");
     else setStatus("Blake is with you…");
     return;
   }
 
-  if (isPlayingAI && !speakerMuted) {
+  if (playerIsActuallyPlaying && !speakerMuted) {
     setStatus("Blake speaking…");
     return;
   }
@@ -312,6 +302,53 @@ function sleep(ms) {
 function setDebugText(t) {
   if (!debugEl) return;
   debugEl.textContent = t || "";
+}
+
+function safeSlice(v, n = 180) {
+  return String(v || "").slice(0, n);
+}
+
+function applyActualPlaybackState(flag) {
+  const next = !!flag;
+  if (playerIsActuallyPlaying === next) return;
+  playerIsActuallyPlaying = next;
+  isPlayingAI = next;
+  if (next) {
+    aiSpeechStart = performance.now();
+  }
+  renderStatus();
+}
+
+function installPlayerLifecycleHandlers() {
+  const a = ensureSharedAudio();
+  if (a.__sow_handlers_installed) return;
+
+  a.addEventListener("play", () => {
+    applyActualPlaybackState(true);
+  });
+
+  a.addEventListener("playing", () => {
+    applyActualPlaybackState(true);
+  });
+
+  a.addEventListener("pause", () => {
+    if (a.ended) return;
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("ended", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("abort", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("error", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.__sow_handlers_installed = true;
 }
 
 /* ---------- Hume ---------- */
@@ -487,6 +524,7 @@ function ensureSharedAudio() {
   ttsPlayer.muted = speakerMuted;
   ttsPlayer.volume = speakerMuted ? 0 : 1;
 
+  installPlayerLifecycleHandlers();
   return ttsPlayer;
 }
 
@@ -920,19 +958,14 @@ async function drainTTSQueue() {
       const item = ttsQueue.shift();
       if (!item?.base64) continue;
 
-      isPlayingAI = true;
-      aiSpeechStart = performance.now();
-      renderStatus();
-
       if (isRecording) await stopRecordingTurn({ discard: true });
 
       const ok = await playDataUrlTTS(item.base64, item.mime);
 
-      isPlayingAI = false;
       if (!isCalling) break;
 
       if (!ok) {
-        setTransientStatus("Audio blocked. Tap Call again.", 1800);
+        setTransientStatus("Audio playback failed. Check speaker or tap call again.", 2200);
       }
       renderStatus();
     }
@@ -965,6 +998,8 @@ function waitOnce(target, event, ms = 2000) {
 async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) {
   const a = ensureSharedAudio();
   const myEpoch = ++playbackEpoch;
+
+  applyActualPlaybackState(false);
 
   try {
     a.pause();
@@ -1016,6 +1051,9 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
       if (settled) return;
       settled = true;
       cleanup();
+      if (myEpoch === playbackEpoch) {
+        applyActualPlaybackState(false);
+      }
       resolve(ok);
     };
 
@@ -1094,17 +1132,11 @@ async function playGreetingOnce() {
 
     if (b64) {
       await enqueueTTS(b64, mime);
-
       if (!speakerMuted) {
-        isPlayingAI = true;
-        aiSpeechStart = performance.now();
-        renderStatus();
-
         await drainTTSQueue();
-
-        isPlayingAI = false;
-        renderStatus();
       }
+    } else if (replyText) {
+      setTransientStatus("Greeting text arrived, but no audio came back.", 2200);
     }
 
     renderStatus();
@@ -1154,13 +1186,30 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
     if (!isCalling) return false;
     if (seq !== coachSeq) return false;
 
+    if (data?.debug_audio) {
+      lastDebugAudio = data.debug_audio;
+      log("debug_audio", data.debug_audio);
+    }
+
     const replyText = (data?.assistant_text || data?.text || "").trim();
     if (replyText) addFinalLine("AI: " + replyText);
 
     const b64 = data?.audio_base64;
     const mime = data?.mime || "audio/mpeg";
 
-    if (b64) await enqueueTTS(b64, mime);
+    if (b64) {
+      await enqueueTTS(b64, mime);
+    } else if (data?.audio_expected) {
+      const detail =
+        data?.audio_error ||
+        data?.debug_audio?.tts_error ||
+        "audio missing";
+      warn("audio missing", {
+        detail,
+        debug_audio: data?.debug_audio || null,
+      });
+      setTransientStatus("Reply arrived, but audio did not play.", 2200);
+    }
 
     return true;
   } catch (e) {
@@ -1178,7 +1227,7 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
 /* ---------- BARGE-IN ---------- */
 function stopAIForBargeIn() {
   if (!ttsPlayer) return;
-  if (!isPlayingAI) return;
+  if (!playerIsActuallyPlaying && !isPlayingAI) return;
 
   playbackEpoch++;
 
@@ -1204,7 +1253,7 @@ function stopAIForBargeIn() {
   isMerging = false;
   setInterim("");
 
-  isPlayingAI = false;
+  applyActualPlaybackState(false);
   renderStatus();
   log("🛑 Barge-in: AI stopped");
 }
@@ -1235,12 +1284,12 @@ async function startVADLoop() {
     const startThr = thr * VAD_START_MULT;
     const contThr = thr * VAD_CONT_MULT;
 
-    const allowVADStart = !(isPlayingAI && !speakerMuted);
+    const allowVADStart = !(playerIsActuallyPlaying && !speakerMuted);
 
     const isVoiceStart = !micMuted && energy > startThr;
     const isVoiceCont = !micMuted && energy > contThr;
 
-    if (isPlayingAI && !micMuted) {
+    if (playerIsActuallyPlaying && !micMuted) {
       const canBarge = now - aiSpeechStart > BARGE_COOLDOWN_MS;
       const isLoudVoice = energy > thr * BARGE_EXTRA_MULT;
 
@@ -1327,13 +1376,15 @@ async function startVADLoop() {
     }
 
     if (debugOn) {
+      const dbg = lastDebugAudio || {};
       setDebugText(
         `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
-          `phase=${callPhase}  AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
-          `energy=${energy.toFixed(4)}  noise=${noiseFloor
-            .toFixed(4)}  thr=${thr.toFixed(4)}\n` +
+          `phase=${callPhase}  AI=${playerIsActuallyPlaying}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
+          `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
           `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}\n` +
-          `humeReady=${humeReady}  humeActive=${humeActive}`
+          `humeReady=${humeReady}  humeActive=${humeActive}\n` +
+          `tts_status=${safeSlice(dbg.tts_status || "")}  tts_bytes=${safeSlice(dbg.tts_audio_bytes || "")}\n` +
+          `tts_err=${safeSlice(dbg.tts_error || dbg.tts_throw || "")}`
       );
     }
 
@@ -1495,6 +1546,7 @@ async function startCall() {
 
   greetingDone = false;
   ringPlayed = false;
+  lastDebugAudio = null;
 
   lastUserSentText = "";
   lastUserSentAt = 0;
@@ -1512,6 +1564,7 @@ async function startCall() {
   isThinking = false;
   isMerging = false;
   vadStartCandidateAt = 0;
+  applyActualPlaybackState(false);
 
   startTimer();
 
@@ -1635,7 +1688,7 @@ function endCall() {
       ttsPlayer.currentTime = 0;
     }
   } catch {}
-  isPlayingAI = false;
+  applyActualPlaybackState(false);
 
   closeAudioContexts();
 
@@ -1648,5 +1701,5 @@ ensureSharedAudio();
 renderStatus();
 initHumeRealtime().catch(() => {});
 log(
-  "✅ call.js loaded: secure Hume token flow + iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM presence phases (Connecting mic / Calling Blake / Blake joined / Blake speaking / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded with actual-playback speaking state + debug_audio logging"
 );

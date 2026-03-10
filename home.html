@@ -5,12 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Son of Wisdom — Home</title>
   <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="/Sonofwisdom.png" type="image/png" />
 </head>
 
 <body class="sow-shell chat-app">
-  <!-- Top app bar -->
   <header class="appbar">
-    <!-- ✅ Hamburger icon button (3 bars). Style is in style.css: .icon-btn.hamburger span -->
     <button
       id="btn-menu"
       class="icon-btn hamburger"
@@ -35,11 +34,12 @@
     </button>
   </header>
 
-  <!-- Main content -->
-  <main class="content" role="main">
-    <section class="hero-mini">
-      <h1 class="hero-mini-title">Son of Wisdom</h1>
-      <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+  <main class="content home-content" role="main">
+    <section class="hero-mini hero-mini-home">
+      <div class="hero-mini-copy">
+        <h1 class="hero-mini-title">Son of Wisdom</h1>
+        <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+      </div>
     </section>
 
     <section class="chips simple-chips" aria-label="Suggestions">
@@ -68,10 +68,21 @@
       </button>
     </section>
 
+    <section class="upload-help" aria-label="Upload help">
+      <div class="upload-help-title">Upload support</div>
+      <div class="upload-help-copy">
+        Supported now: PDF and TXT.
+      </div>
+      <div class="upload-help-copy">
+        Coming next: JPG, PNG, JPEG screenshot coaching.
+      </div>
+    </section>
+
     <section
       id="chat-panel"
       class="chat-panel"
       aria-live="polite"
+      aria-label="Conversation"
     >
       <div id="chat-box" class="chat-box"></div>
     </section>
@@ -79,7 +90,6 @@
     <div id="status" class="status-line tiny">Signed in. How can I help?</div>
   </main>
 
-  <!-- Composer dock -->
   <footer id="composer" class="composer" role="contentinfo">
     <div class="dock">
       <div class="dock-tools">
@@ -126,10 +136,6 @@
       </div>
     </div>
   </footer>
-
-  <!-- App logic -->
-  <!-- DEV ONLY: keep this commented on production so we don't load dev-local.js -->
-  <!-- <script src="app/dev-local.js"></script> -->
 
   <script type="module" src="app/home.js"></script>
 </body>

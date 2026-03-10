@@ -2,22 +2,13 @@
 // Process Uploaded File -> Extract text -> Chunk -> Embed -> Store in Supabase
 // Node 18+ ESM (Netlify Functions)
 //
-// Accepts: application/json POST
-// {
-//   storage_path: "uploads/<...>/<filename>",
-//   filename: "my.pdf",
-//   content_type?: "application/pdf" | "text/plain" | ...,
-//   bytes?: number,
-//   conversation_id: "<uuid>",
-//   user_id: "<uuid or string>",
-//   bucket?: "uploads" (default)
-// }
-//
-// Supports: PDF + TXT only
+// Supports:
+// - PDF + TXT => full extract/chunk/embed
+// - JPG/JPEG/PNG/WEBP => store document row only for now
 //
 // Writes:
-// - conversation_documents (one row per uploaded doc)
-// - conversation_document_chunks (many rows with embeddings)
+// - conversation_documents (all supported uploads)
+// - conversation_document_chunks (text docs only)
 
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
@@ -67,6 +58,18 @@ function isTxt(filename = "", mime = "") {
   return m.startsWith("text/") || n.endsWith(".txt");
 }
 
+function isImage(filename = "", mime = "") {
+  const n = String(filename).toLowerCase();
+  const m = String(mime).toLowerCase();
+  return (
+    m.startsWith("image/") ||
+    n.endsWith(".jpg") ||
+    n.endsWith(".jpeg") ||
+    n.endsWith(".png") ||
+    n.endsWith(".webp")
+  );
+}
+
 function normalizeWhitespace(s) {
   return String(s || "")
     .replace(/\r\n/g, "\n")
@@ -76,7 +79,6 @@ function normalizeWhitespace(s) {
     .trim();
 }
 
-// Simple chunking (stable, no dependencies)
 function chunkText(text, { wordsPerChunk = 650, overlapWords = 90 } = {}) {
   const clean = normalizeWhitespace(text);
   if (!clean) return [];
@@ -180,23 +182,23 @@ export const handler = async (event) => {
       };
     }
 
-    // Only PDF + TXT
     const allowPdf = isPdf(filename, content_type);
     const allowTxt = isTxt(filename, content_type);
+    const allowImage = isImage(filename, content_type);
 
-    if (!allowPdf && !allowTxt) {
+    if (!allowPdf && !allowTxt && !allowImage) {
       return {
         statusCode: 415,
         headers: noStoreHeaders,
         body: JSON.stringify({
-          error: "Unsupported file type. Only PDF + TXT are supported.",
+          error: "Unsupported file type",
+          supported: ["pdf", "txt", "jpg", "jpeg", "png", "webp"],
           filename,
           content_type,
         }),
       };
     }
 
-    // 1) Download from Supabase Storage
     const { data: fileData, error: downloadError } = await supabase.storage
       .from(bucket)
       .download(storage_path);
@@ -216,7 +218,42 @@ export const handler = async (event) => {
 
     const buffer = Buffer.from(await fileData.arrayBuffer());
 
-    // 2) Extract text using shared lib
+    // Images: store document row only for now.
+    if (allowImage) {
+      const { data: doc, error: docErr } = await supabase
+        .from("conversation_documents")
+        .insert({
+          conversation_id,
+          user_id,
+          storage_bucket: bucket,
+          storage_path,
+          filename: filename || "upload",
+          content_type: content_type || "image/jpeg",
+          bytes: typeof body.bytes === "number" ? body.bytes : buffer.length,
+        })
+        .select()
+        .single();
+
+      if (docErr || !doc?.id) {
+        throw docErr || new Error("Failed to create image conversation_documents row");
+      }
+
+      return {
+        statusCode: 200,
+        headers: noStoreHeaders,
+        body: JSON.stringify({
+          ok: true,
+          document_id: doc.id,
+          image_stored: true,
+          indexed: false,
+          reason: "Images are stored, but not chunk-embedded in this path yet.",
+          bucket,
+          storage_path,
+          filename,
+        }),
+      };
+    }
+
     const extracted = await extractTextFromBuffer(
       buffer,
       filename,
@@ -228,7 +265,7 @@ export const handler = async (event) => {
         statusCode: 415,
         headers: noStoreHeaders,
         body: JSON.stringify({
-          error: "Unsupported file type (PDF + TXT only)",
+          error: "Unsupported file type",
           filename,
           content_type,
         }),
@@ -251,7 +288,6 @@ export const handler = async (event) => {
       };
     }
 
-    // 3) Create conversation_documents row
     const { data: doc, error: docErr } = await supabase
       .from("conversation_documents")
       .insert({
@@ -271,16 +307,13 @@ export const handler = async (event) => {
       throw docErr || new Error("Failed to create conversation_documents row");
     }
 
-    // 4) Chunk
     const chunks = chunkText(text, { wordsPerChunk: 650, overlapWords: 90 });
 
-    // 5) Embed + insert chunks (batched)
     const BATCH_SIZE = 20;
     let batch = [];
     let created = 0;
 
     for (let i = 0; i < chunks.length; i++) {
-      // Force string + safe trim
       const chunk = String(chunks[i] || "").trim();
       if (!chunk) continue;
 
