@@ -9,14 +9,12 @@
   />
   <title>Son of Wisdom — Call</title>
 
-  <!-- iOS/Safari + mobile niceties -->
   <meta name="theme-color" content="#0b0f14" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 
   <link rel="stylesheet" href="style.css" />
 
-  <!-- iOS dynamic viewport fix (prevents “UI gets bigger”) -->
   <script>
     (function () {
       function setVH() {
@@ -30,7 +28,6 @@
 </head>
 
 <body class="sow-shell page-call">
-  <!-- App bar -->
   <header class="appbar">
     <button
       id="btn-back-home"
@@ -51,9 +48,7 @@
     </a>
   </header>
 
-  <!-- Main content -->
   <main class="content call-layout" role="main">
-    <!-- Left: call card -->
     <section class="call-main">
       <section class="hero-mini">
         <h1 class="hero-mini-title">Call with AI Blake</h1>
@@ -64,7 +59,6 @@
 
       <section>
         <div class="call-card">
-          <!-- Avatar + animated ring -->
           <div class="call-avatar-wrap" id="avatar-container">
             <canvas id="voiceRing"></canvas>
             <img src="avatar-blake.jpg" alt="AI Blake" class="call-avatar-img" />
@@ -78,7 +72,6 @@
 
           <div class="call-timer" id="call-timer">00:00</div>
 
-          <!-- Call controls -->
           <div class="call-controls labeled">
             <div class="call-control">
               <button
@@ -106,7 +99,6 @@
               <div class="call-label" id="mic-label">Mute</div>
             </div>
 
-            <!-- Audio output toggle (accurate for iPhone speaker / AirPods / car / etc.) -->
             <div class="call-control">
               <button
                 id="speaker-btn"
@@ -122,7 +114,38 @@
             </div>
           </div>
 
-          <!-- Mode toggle -->
+          <div
+            class="row"
+            style="margin-top:0.9rem;justify-content:center;gap:0.55rem;flex-wrap:wrap;"
+          >
+            <label
+              for="vad-profile"
+              class="tiny"
+              style="color:rgba(148,163,184,.95);"
+            >
+              Mic sensitivity
+            </label>
+
+            <select
+              id="vad-profile"
+              class="input"
+              style="width:auto;min-width:170px;padding:0.55rem 0.85rem;border-radius:12px;"
+              aria-label="Mic sensitivity profile"
+            >
+              <option value="quiet">Quiet room</option>
+              <option value="normal">Normal room</option>
+              <option value="noisy" selected>Noisy room</option>
+            </select>
+
+            <span
+              id="vad-profile-note"
+              class="tiny"
+              style="color:rgba(148,163,184,.9);"
+            >
+              Default: Noisy room
+            </span>
+          </div>
+
           <div class="row" style="margin-top:0.75rem;justify-content:center;gap:0.5rem;">
             <button
               id="mode-btn"
@@ -138,7 +161,6 @@
       </section>
     </section>
 
-    <!-- Right: live transcript panel -->
     <aside class="call-side-transcript" aria-label="Live transcription">
       <div class="transcript-wrap" style="height:100%;min-height:0;">
         <div class="ts-header" style="padding-bottom:0.45rem;">
@@ -166,12 +188,20 @@
         </div>
 
         <div class="ts-footer">
-          <div class="row">
-            <span>Auto-scroll</span>
-            <button id="ts-autoscroll" class="btn small ghost" type="button" aria-pressed="true">
-              On
-            </button>
+          <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
+            <div class="row">
+              <span>Auto-scroll</span>
+              <button id="ts-autoscroll" class="btn small ghost" type="button" aria-pressed="true">
+                On
+              </button>
+            </div>
+
+            <div class="row">
+              <span>Profile</span>
+              <code id="vad-profile-readout">noisy</code>
+            </div>
           </div>
+
           <span class="hint">
             Tip: Press <code>c</code> to return to chat. Press <code>d</code> to toggle debug.
           </span>
@@ -184,10 +214,8 @@
     Built for sons, warriors, and kings learning to govern their homes.
   </footer>
 
-  <!-- Dev HUD (hidden by default; toggle with "d") -->
   <div id="call-debug" class="call-debug" hidden></div>
 
-  <!-- Back to home (same conversation) -->
   <script type="module">
     const params = new URLSearchParams(window.location.search);
     const conversationId = params.get("c");
@@ -211,7 +239,6 @@
     }
   </script>
 
-  <!-- App logic (module) -->
   <script type="module" src="app/call.js"></script>
 </body>
 </html>

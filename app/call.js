@@ -1,12 +1,14 @@
 // app/call.js
 // Son of Wisdom — Call mode
 //
-// FIXES ADDED:
-// - speaking state now follows actual audio playback events
-// - backend debug_audio is logged and surfaced in debug HUD
-// - no fake "Blake is speaking" before audio actually starts
-// - better handling when TTS text exists but audio is missing
-// - keeps existing iOS-safe queue / ring / VAD behavior
+// Includes:
+// - actual playback speaking state
+// - backend debug_audio logging
+// - VAD sensitivity profiles: quiet / normal / noisy
+// - noisy room default
+// - stricter mic gating
+// - iOS-safe ring + playback queue
+// - transcript + timer + debug HUD
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -45,7 +47,71 @@ const voiceRing = document.getElementById("voiceRing");
 const callTimerEl = document.getElementById("call-timer");
 const callLabelEl = document.getElementById("call-label");
 
+const vadProfileSelect = document.getElementById("vad-profile");
+const vadProfileNote = document.getElementById("vad-profile-note");
+const vadProfileReadout = document.getElementById("vad-profile-readout");
+
 const debugEl = document.getElementById("call-debug");
+
+/* ---------- VAD PROFILES ---------- */
+const VAD_PROFILES = {
+  quiet: {
+    name: "quiet",
+    label: "Quiet room",
+    note: "More responsive. Best in a silent room.",
+    VAD_START_HOLD_MS: 180,
+    noiseFloor: 0.012,
+    VAD_MIN_SPEECH_MS: 620,
+    THRESHOLD_MULTIPLIER: 3.0,
+    THRESHOLD_MIN: 0.03,
+    THRESHOLD_MAX: 0.11,
+    VAD_START_MULT: 1.3,
+    VAD_CONT_MULT: 0.86,
+    BARGE_MIN_HOLD_MS: 300,
+    BARGE_EXTRA_MULT: 1.65,
+  },
+  normal: {
+    name: "normal",
+    label: "Normal room",
+    note: "Balanced for typical indoor use.",
+    VAD_START_HOLD_MS: 220,
+    noiseFloor: 0.015,
+    VAD_MIN_SPEECH_MS: 720,
+    THRESHOLD_MULTIPLIER: 3.4,
+    THRESHOLD_MIN: 0.035,
+    THRESHOLD_MAX: 0.12,
+    VAD_START_MULT: 1.38,
+    VAD_CONT_MULT: 0.88,
+    BARGE_MIN_HOLD_MS: 360,
+    BARGE_EXTRA_MULT: 1.78,
+  },
+  noisy: {
+    name: "noisy",
+    label: "Noisy room",
+    note: "Stricter. Best for fans, keyboards, and room noise.",
+    VAD_START_HOLD_MS: 260,
+    noiseFloor: 0.018,
+    VAD_MIN_SPEECH_MS: 800,
+    THRESHOLD_MULTIPLIER: 3.8,
+    THRESHOLD_MIN: 0.04,
+    THRESHOLD_MAX: 0.14,
+    VAD_START_MULT: 1.45,
+    VAD_CONT_MULT: 0.9,
+    BARGE_MIN_HOLD_MS: 420,
+    BARGE_EXTRA_MULT: 1.9,
+  },
+};
+
+const VAD_PROFILE_STORAGE_KEY = "sow_vad_profile";
+const DEFAULT_VAD_PROFILE = "noisy";
+
+let currentVadProfileName =
+  localStorage.getItem(VAD_PROFILE_STORAGE_KEY) || DEFAULT_VAD_PROFILE;
+if (!VAD_PROFILES[currentVadProfileName]) {
+  currentVadProfileName = DEFAULT_VAD_PROFILE;
+}
+
+let currentVadProfile = VAD_PROFILES[currentVadProfileName];
 
 /* ---------- STATE ---------- */
 let isCalling = false;
@@ -78,39 +144,19 @@ let vadLoopRunning = false;
 let vadState = "idle";
 let lastVoiceTime = 0;
 let speechStartTime = 0;
-
-/* Hume realtime */
-let humeReady = false;
-let humeActive = false;
-
-/* require voice hold before start */
-const VAD_START_HOLD_MS = 140;
 let vadStartCandidateAt = 0;
 
-/* Adaptive noise floor */
-let noiseFloor = 0.012;
+/* adaptive floor */
+let noiseFloor = currentVadProfile.noiseFloor;
 let lastNoiseUpdate = 0;
 
-/* Phone-call pace tuning */
+/* fixed VAD pacing */
 const VAD_SILENCE_MS = 1500;
 const VAD_MERGE_WINDOW_MS = 1700;
-const VAD_MIN_SPEECH_MS = 520;
 const VAD_IDLE_TIMEOUT_MS = 30000;
-
-/* threshold shaping */
 const NOISE_FLOOR_UPDATE_MS = 300;
-const THRESHOLD_MULTIPLIER = 2.85;
-const THRESHOLD_MIN = 0.026;
-const THRESHOLD_MAX = 0.11;
-
-/* hysteresis */
-const VAD_START_MULT = 1.25;
-const VAD_CONT_MULT = 0.82;
-
-/* Barge-in debouncing */
-const BARGE_MIN_HOLD_MS = 260;
 const BARGE_COOLDOWN_MS = 900;
-const BARGE_EXTRA_MULT = 1.55;
+
 let bargeVoiceStart = 0;
 let aiSpeechStart = 0;
 
@@ -127,10 +173,7 @@ let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
 
-/* playback epoch guard */
 let playbackEpoch = 0;
-
-/* AI speaking flags */
 let isPlayingAI = false;
 let playerIsActuallyPlaying = false;
 
@@ -177,12 +220,34 @@ let transientUntil = 0;
 
 /* Call phases */
 let callPhase = "idle"; // idle | requesting_mic | ringing | joined | greeting | live
-
-/* Premium presence timing */
 const PRESENCE_JOIN_MS = 420;
 const PRESENCE_HANDOFF_MS = 1200;
 
 /* ---------- Helpers ---------- */
+function getVadSetting(key) {
+  return currentVadProfile[key];
+}
+
+function applyVadProfile(name, { persist = true } = {}) {
+  const next = VAD_PROFILES[name] || VAD_PROFILES[DEFAULT_VAD_PROFILE];
+  currentVadProfileName = next.name;
+  currentVadProfile = next;
+  noiseFloor = next.noiseFloor;
+  lastNoiseUpdate = performance.now();
+
+  if (persist) {
+    localStorage.setItem(VAD_PROFILE_STORAGE_KEY, next.name);
+  }
+
+  if (vadProfileSelect) vadProfileSelect.value = next.name;
+  if (vadProfileNote) vadProfileNote.textContent = next.note;
+  if (vadProfileReadout) vadProfileReadout.textContent = next.name;
+
+  setTransientStatus(`Mic profile: ${next.label}`, 1400);
+  renderStatus();
+  log("✅ VAD profile set:", next);
+}
+
 function setStatus(t) {
   if (!statusText) return;
   statusText.textContent = t || "";
@@ -319,39 +384,10 @@ function applyActualPlaybackState(flag) {
   renderStatus();
 }
 
-function installPlayerLifecycleHandlers() {
-  const a = ensureSharedAudio();
-  if (a.__sow_handlers_installed) return;
-
-  a.addEventListener("play", () => {
-    applyActualPlaybackState(true);
-  });
-
-  a.addEventListener("playing", () => {
-    applyActualPlaybackState(true);
-  });
-
-  a.addEventListener("pause", () => {
-    if (a.ended) return;
-    applyActualPlaybackState(false);
-  });
-
-  a.addEventListener("ended", () => {
-    applyActualPlaybackState(false);
-  });
-
-  a.addEventListener("abort", () => {
-    applyActualPlaybackState(false);
-  });
-
-  a.addEventListener("error", () => {
-    applyActualPlaybackState(false);
-  });
-
-  a.__sow_handlers_installed = true;
-}
-
 /* ---------- Hume ---------- */
+let humeReady = false;
+let humeActive = false;
+
 async function initHumeRealtime() {
   if (!HUME_ENABLED) return false;
   if (humeReady) return true;
@@ -419,8 +455,11 @@ micBtn?.addEventListener("click", () => {
   micMuted = !micMuted;
   micBtn?.setAttribute("aria-pressed", String(micMuted));
 
-  if (globalStream)
-    globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+  if (globalStream) {
+    globalStream.getAudioTracks().forEach((t) => {
+      t.enabled = !micMuted;
+    });
+  }
 
   const lbl = document.getElementById("mic-label");
   if (lbl) lbl.textContent = micMuted ? "Unmute" : "Mute";
@@ -438,14 +477,17 @@ speakerBtn?.addEventListener("click", () => {
   }
 
   const lbl = document.getElementById("speaker-label");
-  if (lbl) lbl.textContent = speakerMuted ? "Speaker Off" : "Speaker";
+  if (lbl) lbl.textContent = speakerMuted ? "Speaker Off" : "Audio";
 
   if (!speakerMuted) drainTTSQueue();
 
   renderStatus();
 });
 
-/* Debug toggle + quick key to chat */
+vadProfileSelect?.addEventListener("change", () => {
+  applyVadProfile(vadProfileSelect.value);
+});
+
 window.addEventListener("keydown", (e) => {
   const k = (e.key || "").toLowerCase();
   if (k === "d") {
@@ -459,7 +501,6 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-/* Visibility handling */
 document.addEventListener("visibilitychange", async () => {
   if (!isCalling) return;
 
@@ -514,6 +555,38 @@ const deviceId = getDeviceId();
 const callId = crypto?.randomUUID?.() || `call_${Date.now()}`;
 
 /* ---------- Audio system ---------- */
+function installPlayerLifecycleHandlers() {
+  const a = ensureSharedAudio();
+  if (a.__sow_handlers_installed) return;
+
+  a.addEventListener("play", () => {
+    applyActualPlaybackState(true);
+  });
+
+  a.addEventListener("playing", () => {
+    applyActualPlaybackState(true);
+  });
+
+  a.addEventListener("pause", () => {
+    if (a.ended) return;
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("ended", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("abort", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.addEventListener("error", () => {
+    applyActualPlaybackState(false);
+  });
+
+  a.__sow_handlers_installed = true;
+}
+
 function ensureSharedAudio() {
   if (ttsPlayer) return ttsPlayer;
 
@@ -581,7 +654,9 @@ function primeIOSGesture() {
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
+            autoGainControl: false,
+            channelCount: 1,
+            sampleRate: 48000,
           },
         })
         .then((s) => {
@@ -610,7 +685,7 @@ function primeIOSGesture() {
   }
 }
 
-/* ---------- ring.mp3 SFX ---------- */
+/* ---------- ring.mp3 ---------- */
 async function playRingTwiceOnConnect() {
   if (ringPlayed) return;
   ringPlayed = true;
@@ -697,7 +772,9 @@ async function ensureMicStream() {
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        autoGainControl: false,
+        channelCount: 1,
+        sampleRate: 48000,
       },
     })
     .then((s) => {
@@ -736,10 +813,10 @@ async function setupVAD() {
 
     vadSource.connect(vadAnalyser);
 
-    noiseFloor = 0.012;
+    noiseFloor = currentVadProfile.noiseFloor;
     lastNoiseUpdate = performance.now();
 
-    log("✅ VAD ready (adaptive, phone-call pace)");
+    log("✅ VAD ready with profile:", currentVadProfile.name);
   } catch (e) {
     warn("setupVAD failed", e);
     throw e;
@@ -766,9 +843,9 @@ function getMicEnergy() {
 }
 
 function computeAdaptiveThreshold() {
-  let thr = noiseFloor * THRESHOLD_MULTIPLIER;
-  if (!Number.isFinite(thr)) thr = 0.035;
-  thr = Math.max(THRESHOLD_MIN, Math.min(THRESHOLD_MAX, thr));
+  let thr = noiseFloor * getVadSetting("THRESHOLD_MULTIPLIER");
+  if (!Number.isFinite(thr)) thr = 0.05;
+  thr = Math.max(getVadSetting("THRESHOLD_MIN"), Math.min(getVadSetting("THRESHOLD_MAX"), thr));
   return thr;
 }
 
@@ -780,7 +857,7 @@ function maybeUpdateNoiseFloor(energy, now) {
   const alpha = 0.09;
 
   noiseFloor = noiseFloor * (1 - alpha) + capped * alpha;
-  noiseFloor = Math.max(0.0045, Math.min(0.06, noiseFloor));
+  noiseFloor = Math.max(0.0045, Math.min(0.08, noiseFloor));
 }
 
 /* ---------- RECORD TURN CONTROL ---------- */
@@ -857,9 +934,7 @@ async function transcribeTurn() {
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      throw new Error(
-        `Transcribe HTTP ${resp.status}: ${t || resp.statusText}`
-      );
+      throw new Error(`Transcribe HTTP ${resp.status}: ${t || resp.statusText}`);
     }
 
     const data = await resp.json().catch(() => ({}));
@@ -905,10 +980,7 @@ function queueMergedSend(transcript) {
     if (!isCalling) return;
 
     const now = Date.now();
-    if (
-      final === lastUserSentText &&
-      now - lastUserSentAt < USER_TURN_DEDUPE_MS
-    ) {
+    if (final === lastUserSentText && now - lastUserSentAt < USER_TURN_DEDUPE_MS) {
       log("🟡 dropped duplicate user turn:", final);
       return;
     }
@@ -922,7 +994,7 @@ function queueMergedSend(transcript) {
   }, VAD_MERGE_WINDOW_MS);
 }
 
-/* ---------- Turn queue drain ---------- */
+/* ---------- Turn queue ---------- */
 async function drainTurnQueue() {
   if (drainingTurns) return;
   drainingTurns = true;
@@ -931,9 +1003,7 @@ async function drainTurnQueue() {
     while (isCalling && pendingUserTurns.length) {
       const next = pendingUserTurns.shift();
       if (!next) continue;
-
       await sendTranscriptToCoachAndQueueAudio(next);
-
       if (!isCalling) break;
     }
   } finally {
@@ -941,7 +1011,7 @@ async function drainTurnQueue() {
   }
 }
 
-/* ---------- TTS PLAYBACK QUEUE ---------- */
+/* ---------- TTS queue ---------- */
 async function enqueueTTS(base64, mime) {
   if (!base64) return;
   ttsQueue.push({ base64, mime: mime || "audio/mpeg" });
@@ -974,7 +1044,6 @@ async function drainTTSQueue() {
   }
 }
 
-/* --- event helper --- */
 function waitOnce(target, event, ms = 2000) {
   return new Promise((resolve) => {
     let done = false;
@@ -994,7 +1063,6 @@ function waitOnce(target, event, ms = 2000) {
   });
 }
 
-/* --- Safari-safe playback --- */
 async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) {
   const a = ensureSharedAudio();
   const myEpoch = ++playbackEpoch;
@@ -1224,7 +1292,7 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
   }
 }
 
-/* ---------- BARGE-IN ---------- */
+/* ---------- Barge-in ---------- */
 function stopAIForBargeIn() {
   if (!ttsPlayer) return;
   if (!playerIsActuallyPlaying && !isPlayingAI) return;
@@ -1258,7 +1326,7 @@ function stopAIForBargeIn() {
   log("🛑 Barge-in: AI stopped");
 }
 
-/* ---------- VAD main loop ---------- */
+/* ---------- VAD loop ---------- */
 async function startVADLoop() {
   if (vadLoopRunning) return;
   vadLoopRunning = true;
@@ -1281,8 +1349,8 @@ async function startVADLoop() {
     const now = performance.now();
     const thr = computeAdaptiveThreshold();
 
-    const startThr = thr * VAD_START_MULT;
-    const contThr = thr * VAD_CONT_MULT;
+    const startThr = thr * getVadSetting("VAD_START_MULT");
+    const contThr = thr * getVadSetting("VAD_CONT_MULT");
 
     const allowVADStart = !(playerIsActuallyPlaying && !speakerMuted);
 
@@ -1291,11 +1359,11 @@ async function startVADLoop() {
 
     if (playerIsActuallyPlaying && !micMuted) {
       const canBarge = now - aiSpeechStart > BARGE_COOLDOWN_MS;
-      const isLoudVoice = energy > thr * BARGE_EXTRA_MULT;
+      const isLoudVoice = energy > thr * getVadSetting("BARGE_EXTRA_MULT");
 
       if (canBarge && isLoudVoice) {
         if (!bargeVoiceStart) bargeVoiceStart = now;
-        if (now - bargeVoiceStart >= BARGE_MIN_HOLD_MS) {
+        if (now - bargeVoiceStart >= getVadSetting("BARGE_MIN_HOLD_MS")) {
           stopAIForBargeIn();
           bargeVoiceStart = 0;
         }
@@ -1311,7 +1379,7 @@ async function startVADLoop() {
         if (!vadStartCandidateAt) vadStartCandidateAt = now;
 
         const heldFor = now - vadStartCandidateAt;
-        if (heldFor >= VAD_START_HOLD_MS) {
+        if (heldFor >= getVadSetting("VAD_START_HOLD_MS")) {
           vadStartCandidateAt = 0;
 
           vadState = "speaking";
@@ -1330,7 +1398,9 @@ async function startVADLoop() {
       } else {
         vadStartCandidateAt = 0;
 
-        if (!micMuted && allowVADStart) maybeUpdateNoiseFloor(energy, now);
+        if (!micMuted && allowVADStart) {
+          maybeUpdateNoiseFloor(energy, now);
+        }
       }
     } else if (vadState === "speaking") {
       vadStartCandidateAt = 0;
@@ -1353,7 +1423,7 @@ async function startVADLoop() {
             return;
           }
 
-          if (speechLen < VAD_MIN_SPEECH_MS) {
+          if (speechLen < getVadSetting("VAD_MIN_SPEECH_MS")) {
             recordChunks = [];
             renderStatus();
           } else {
@@ -1378,9 +1448,11 @@ async function startVADLoop() {
     if (debugOn) {
       const dbg = lastDebugAudio || {};
       setDebugText(
-        `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
+        `profile=${currentVadProfile.name}\n` +
+          `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
           `phase=${callPhase}  AI=${playerIsActuallyPlaying}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
           `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
+          `hold=${getVadSetting("VAD_START_HOLD_MS")}  minSpeech=${getVadSetting("VAD_MIN_SPEECH_MS")}\n` +
           `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}\n` +
           `humeReady=${humeReady}  humeActive=${humeActive}\n` +
           `tts_status=${safeSlice(dbg.tts_status || "")}  tts_bytes=${safeSlice(dbg.tts_audio_bytes || "")}\n` +
@@ -1394,7 +1466,7 @@ async function startVADLoop() {
   loop();
 }
 
-/* ---------- RING CANVAS ---------- */
+/* ---------- Ring canvas ---------- */
 let ringCtx = null;
 let ringRAF = null;
 
@@ -1698,8 +1770,7 @@ function endCall() {
 
 /* ---------- Boot ---------- */
 ensureSharedAudio();
+applyVadProfile(currentVadProfileName, { persist: false });
 renderStatus();
 initHumeRealtime().catch(() => {});
-log(
-  "✅ call.js loaded with actual-playback speaking state + debug_audio logging"
-);
+log("✅ call.js loaded with VAD profiles + actual playback speaking state + debug_audio logging");
