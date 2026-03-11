@@ -1,10 +1,4 @@
 // app/home.js
-// Son of Wisdom — Home page controller
-// Orchestration only.
-// UI rendering lives in home-ui.js.
-// Media/file/audio helpers live in home-media.js.
-// Network/data calls live in home-api.js.
-
 sessionStorage.removeItem("sow_redirected");
 
 import { supabase, ensureAuthedOrRedirect, getSession } from "./supabase.js";
@@ -12,16 +6,18 @@ import { createHomeUI } from "./home-ui.js";
 import { createHomeMedia } from "./home-media.js";
 import { createHomeApi } from "./home-api.js";
 
-/* -------------------------- tiny DOM helpers -------------------------- */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
-/* ------------------------------ config -------------------------------- */
 const CHAT_URL = "/.netlify/functions/call-coach";
 const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
 const UPLOAD_URL = "/.netlify/functions/upload-file";
 const EXTRACT_URL = "/.netlify/functions/file-extract";
 const PROCESS_UPLOAD_URL = "/.netlify/functions/process-upload";
+
+const HOME_VERSION = "home-artifact-ux-v3";
+window.SOW_HOME_VERSION = HOME_VERSION;
+console.log("[HOME] version:", HOME_VERSION);
 
 const DEV_DIRECT_OPENAI = false;
 const DEV_OPENAI_MODEL = window.OPENAI_MODEL || "gpt-4o-mini";
@@ -33,7 +29,6 @@ TTS-SAFE • CONVERSATIONAL • DIAGNOSTIC-FIRST • SHORT RESPONSES • VARIATI
 YOU ARE: AI BLAKE
 `.trim();
 
-/* ------------------------------ state -------------------------------- */
 let session = null;
 let sending = false;
 let conversationId = null;
@@ -49,7 +44,6 @@ const contextState = {
   lastUpdatedAt: null,
 };
 
-/* ------------------------------ UI refs ------------------------------- */
 const refs = {
   chipsRow: $(".simple-chips"),
   chips: $$(".chip"),
@@ -84,7 +78,6 @@ const api = createHomeApi({
   devSystemPrompt: DEV_SYSTEM_PROMPT,
 });
 
-/* ------------------------- conversation utils ------------------------- */
 function getConversationIdFromUrl() {
   const url = new URL(window.location.href);
   return url.searchParams.get("c") || null;
@@ -159,7 +152,6 @@ async function hydrateConversationMeta() {
   await hydrateConversationArtifacts();
 }
 
-/* -------------------- load previous messages -------------------- */
 async function loadConversationHistory(convId) {
   if (!convId || !refs.chatBox) return;
 
@@ -182,7 +174,6 @@ async function loadConversationHistory(convId) {
   }
 }
 
-/* ----------------------------- helpers ----------------------------- */
 function addArtifact(meta) {
   const cleanName = String(meta?.filename || meta?.fileName || "").trim();
   if (!cleanName) return;
@@ -213,11 +204,15 @@ function setRecordingUi(flag) {
   }
 }
 
-function appendFileNotice(filename) {
-  ui.appendBubble("user", `Uploaded: ${filename}`);
+function appendFileNotice(filename, kind = "file") {
+  const label =
+    typeof media.buildArtifactUserLabel === "function"
+      ? media.buildArtifactUserLabel({ fileName: filename, kind })
+      : `Uploaded ${kind}: ${filename}`;
+
+  ui.appendBubble("user", label);
 }
 
-/* ----------------------------- files flow ----------------------------- */
 async function handleFilesClick() {
   if (sending) return;
 
@@ -230,7 +225,7 @@ async function handleFilesClick() {
   contextState.lastMode = "files";
   ui.refreshContextUI();
 
-  appendFileNotice(file.name);
+  appendFileNotice(file.name, media.isImageFile(file) ? "image" : "file");
   const aiBubble = ui.appendBubble("ai", "Checking your file…");
 
   if (!media.isPdfOrTextFile(file) && !media.isImageFile(file)) {
@@ -244,7 +239,7 @@ async function handleFilesClick() {
 
   sending = true;
   ui.setSendingState(true);
-  ui.setStatus("Processing file…");
+  ui.setStatus("Processing upload…");
 
   let audioUrlToRevoke = null;
 
@@ -294,7 +289,7 @@ async function handleFilesClick() {
 
     ui.updateBubbleText(
       aiBubble,
-      media.isImageFile(file) ? "Reading the image…" : "Reading text…"
+      media.isImageFile(file) ? "Reading the screenshot or image…" : "Reading the document…"
     );
 
     const extracted = await media.extractFileText(file);
@@ -312,11 +307,46 @@ async function handleFilesClick() {
 
     ui.updateBubbleText(
       aiBubble,
-      isImageFlow ? "Understanding the screenshot…" : "Summarizing…"
+      isImageFlow ? "Understanding the image content…" : "Understanding the document…"
     );
 
-    const wantAudio = !!voiceRepliesEnabled;
-    const prompt = isImageFlow
+    let artifactMode = isImageFlow
+      ? media.classifyImageText(text, extracted?.fileName || file.name)
+      : media.classifyDocumentText(text, extracted?.fileName || file.name);
+
+    const artifactFamily = isImageFlow ? "image" : "document";
+
+    const confidenceInfo =
+      typeof media.getArtifactConfidence === "function"
+        ? media.getArtifactConfidence({
+            text,
+            fileName: extracted?.fileName || file.name,
+            isImage: isImageFlow,
+          })
+        : { ambiguous: false, confidence: "medium" };
+
+    if (confidenceInfo?.ambiguous) {
+      const choices =
+        typeof media.buildArtifactClarifyChoices === "function"
+          ? media.buildArtifactClarifyChoices(isImageFlow)
+          : [];
+
+      const choiceText = choices.length
+        ? choices.map((c, i) => `${i + 1}. ${c.label}`).join("\n")
+        : "";
+
+      ui.updateBubbleText(
+        aiBubble,
+        `I read the file, but the content is thin, so I may classify it wrong.\n\nReply with one of these:\n${choiceText}\n\nOr just type what it is in a few words.`
+      );
+
+      ui.setStatus("Artifact type unclear.", true);
+      sending = false;
+      ui.setSendingState(false);
+      return;
+    }
+
+    const hiddenPrompt = isImageFlow
       ? media.buildImageCoachingPrompt({
           fileName: extracted?.fileName || file.name,
           text,
@@ -327,301 +357,261 @@ async function handleFilesClick() {
           pages: extracted?.pages || null,
         });
 
+    const visibleArtifactText =
+      typeof media.buildArtifactUserLabel === "function"
+        ? media.buildArtifactUserLabel({
+            fileName: extracted?.fileName || file.name,
+            kind: extracted?.kind || artifactFamily,
+            mode: artifactMode,
+          })
+        : `Uploaded: ${extracted?.fileName || file.name}`;
+
+    const wantAudio = !!voiceRepliesEnabled;
+
     const res = await api.coachRequest({
-      text: prompt,
+      text: visibleArtifactText,
+      hiddenPrompt,
       source: wantAudio ? "voice" : "chat",
       wantAudio,
       conversationId,
       userId: session?.user?.id || session?.user?.email || "",
-      deviceId: localStorage.getItem("sow_device_id") || "",
+      deviceId: getDeviceId(),
       extra: {
-        email: session?.user?.email ?? null,
-        page: "home",
         input_mode: isImageFlow ? "image" : "files",
-        file_name: file.name,
-        file_type: file.type || null,
-        extracted_pages: extracted?.pages ?? null,
-        extracted_chars: extracted?.chars ?? null,
-        extracted_kind: extracted?.kind ?? null,
-        timestamp: new Date().toISOString(),
+        file_name: extracted?.fileName || file.name,
+        extracted_kind: extracted?.kind || artifactFamily,
+        artifact_family: artifactFamily,
+        artifact_mode: artifactMode,
+        pages: extracted?.pages || null,
       },
     });
 
-    contextState.lastUsedKnowledge = !!res.usedKnowledge;
-    contextState.lastUsedFileContext = !!res.usedFileContext;
-    contextState.lastMode = "files";
+    if (res?.debug?.version) {
+      console.log("[HOME] backend version:", res.debug.version);
+    }
+
+    const assistantText = String(res?.assistant_text || "").trim();
+    ui.updateBubbleText(
+      aiBubble,
+      assistantText || "I read it, but I don’t have a strong response yet."
+    );
+
+    contextState.lastUsedKnowledge = !!res?.usedKnowledge;
+    contextState.lastUsedFileContext = !!res?.usedFileContext;
     ui.refreshContextUI();
 
-    ui.updateBubbleText(aiBubble, res.assistant_text || "…");
-    ui.addAssistantSourceMarkers(aiBubble, {
-      usedKnowledge: !!res.usedKnowledge,
-      usedFileContext: !!res.usedFileContext,
-    });
+    if (wantAudio && res?.audio_base64) {
+      const mime = res?.mime || "audio/mpeg";
+      const blob = media.base64ToBlob
+        ? media.base64ToBlob(res.audio_base64, mime)
+        : new Blob(
+            [Uint8Array.from(atob(res.audio_base64), (c) => c.charCodeAt(0))],
+            { type: mime }
+          );
 
-    if (res.audio_base64 && wantAudio) {
-      const { url } = media.base64ToBlobUrl(
-        res.audio_base64,
-        res.mime || "audio/mpeg"
-      );
-      audioUrlToRevoke = url;
-
-      const audioRow = document.createElement("div");
-      audioRow.className = "bubble-audio-row";
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "bubble-audio-btn";
-      btn.textContent = "Play voice";
-      btn.addEventListener("click", async () => {
-        await media.unlockAudioSystem();
-        await media.playAudioUrl(url);
-      });
-
-      audioRow.appendChild(btn);
-      aiBubble?.wrap?.appendChild(audioRow);
-
-      await media.playAudioUrl(url);
+      audioUrlToRevoke = URL.createObjectURL(blob);
+      await media.playAudioUrl?.(audioUrlToRevoke);
     }
 
     await hydrateConversationMeta();
-    ui.setStatus("Ready.");
+    ui.setStatus("Done.");
   } catch (err) {
-    console.error("[HOME] file flow error:", err);
+    console.error("[HOME] handleFilesClick failed:", err);
     ui.updateBubbleText(
       aiBubble,
-      "Sorry — I could not process that file. Try a clearer screenshot, a smaller PDF, or a cleaner text file."
+      "That upload hit a problem while I was processing it. Check the function logs and try again."
     );
-    ui.setStatus("File processing failed. Try again.", true);
+    ui.setStatus("File processing failed.", true);
   } finally {
+    if (audioUrlToRevoke) {
+      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 4000);
+    }
     sending = false;
     ui.setSendingState(false);
-    if (audioUrlToRevoke) {
-      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 60000);
-    }
   }
 }
 
-/* ---------------------------- main chat send -------------------------- */
-async function sendCurrentInput() {
-  if (sending) return;
+async function sendTextMessage(rawText, opts = {}) {
+  const text = String(rawText || "").trim();
+  if (!text || sending) return;
 
-  const text = String(refs.input?.value || "").trim();
-  if (!text) return;
-
-  await media.unlockAudioSystem();
   await ensureConversation();
 
-  refs.input.value = "";
-  ui.appendBubble("user", text);
+  const isVoice = !!opts.isVoice;
+  const wantAudio = !!opts.wantAudio;
 
-  const aiBubble = ui.appendBubble("ai", "Thinking…");
   sending = true;
   ui.setSendingState(true);
-  ui.setStatus("Thinking…");
+
+  contextState.lastMode = isVoice ? "voice" : "chat";
+  ui.refreshContextUI();
+
+  ui.appendBubble("user", text);
+  const aiBubble = ui.appendBubble("ai", "Blake is thinking…");
+  ui.setStatus("Waiting for Blake…");
 
   let audioUrlToRevoke = null;
 
   try {
-    const wantAudio = !!voiceRepliesEnabled;
-
     const res = await api.coachRequest({
       text,
-      source: wantAudio ? "voice" : "chat",
+      source: isVoice ? "voice" : "chat",
       wantAudio,
       conversationId,
       userId: session?.user?.id || session?.user?.email || "",
-      deviceId: localStorage.getItem("sow_device_id") || "",
+      deviceId: getDeviceId(),
       extra: {
-        email: session?.user?.email ?? null,
-        page: "home",
-        input_mode: "text",
-        timestamp: new Date().toISOString(),
+        input_mode: isVoice ? "voice" : "chat",
       },
     });
 
-    contextState.lastUsedKnowledge = !!res.usedKnowledge;
-    contextState.lastUsedFileContext = !!res.usedFileContext;
-    contextState.lastMode = wantAudio ? "voice" : "chat";
-
-    if (res.conversationId && !conversationId) {
-      conversationId = res.conversationId;
-      setConversationIdInUrl(conversationId);
+    if (res?.debug?.version) {
+      console.log("[HOME] backend version:", res.debug.version);
     }
 
+    const assistantText = String(res?.assistant_text || "").trim();
+    ui.updateBubbleText(
+      aiBubble,
+      assistantText || "I’m here, brother. Say that again a little more plainly."
+    );
+
+    contextState.lastUsedKnowledge = !!res?.usedKnowledge;
+    contextState.lastUsedFileContext = !!res?.usedFileContext;
     ui.refreshContextUI();
-    ui.updateBubbleText(aiBubble, res.assistant_text || "…");
-    ui.addAssistantSourceMarkers(aiBubble, {
-      usedKnowledge: !!res.usedKnowledge,
-      usedFileContext: !!res.usedFileContext,
-    });
 
-    if (res.audio_base64 && wantAudio) {
-      const { url } = media.base64ToBlobUrl(
-        res.audio_base64,
-        res.mime || "audio/mpeg"
-      );
-      audioUrlToRevoke = url;
+    if (wantAudio && res?.audio_base64) {
+      const mime = res?.mime || "audio/mpeg";
+      const blob = media.base64ToBlob
+        ? media.base64ToBlob(res.audio_base64, mime)
+        : new Blob(
+            [Uint8Array.from(atob(res.audio_base64), (c) => c.charCodeAt(0))],
+            { type: mime }
+          );
 
-      const audioRow = document.createElement("div");
-      audioRow.className = "bubble-audio-row";
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "bubble-audio-btn";
-      btn.textContent = "Play voice";
-      btn.addEventListener("click", async () => {
-        await media.unlockAudioSystem();
-        await media.playAudioUrl(url);
-      });
-
-      audioRow.appendChild(btn);
-      aiBubble?.wrap?.appendChild(audioRow);
-
-      await media.playAudioUrl(url);
+      audioUrlToRevoke = URL.createObjectURL(blob);
+      await media.playAudioUrl?.(audioUrlToRevoke);
     }
 
+    refs.input.value = "";
     await hydrateConversationMeta();
     ui.setStatus("Ready.");
   } catch (err) {
-    console.error("[HOME] sendCurrentInput error:", err);
-    ui.updateBubbleText(aiBubble, "Sorry — something went wrong.");
-    ui.setStatus("Request failed. Try again.", true);
+    console.error("[HOME] sendTextMessage failed:", err);
+    ui.updateBubbleText(
+      aiBubble,
+      "Something broke while I was answering. Check the function logs and try again."
+    );
+    ui.setStatus("Send failed.", true);
   } finally {
+    if (audioUrlToRevoke) {
+      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 4000);
+    }
     sending = false;
     ui.setSendingState(false);
-    if (audioUrlToRevoke) {
-      setTimeout(() => URL.revokeObjectURL(audioUrlToRevoke), 60000);
-    }
   }
 }
 
-/* ------------------------------ speak flow ---------------------------- */
-async function handleSpeakClick() {
-  await media.unlockAudioSystem();
-
-  if (!media.getRecordingState()) {
-    try {
-      await media.startRecording(setRecordingUi);
-    } catch (err) {
-      console.error("[HOME] startRecording error:", err);
-      ui.setStatus("Mic permission denied or unavailable.", true);
-    }
-    return;
-  }
-
+async function toggleVoiceInput() {
   try {
-    const blob = await media.stopRecording(setRecordingUi);
-    if (!blob) {
-      ui.setStatus("No audio captured.", true);
+    await media.unlockAudioSystem();
+
+    if (!media.supportsMediaRecorder()) {
+      ui.setStatus("Your browser does not support voice recording.", true);
       return;
     }
 
-    ui.setStatus("Transcribing…");
-    const text = await media.transcribeAudio(blob);
+    if (media.isRecording()) {
+      setRecordingUi(false);
+      const blob = await media.stopRecording();
+      if (!blob) return;
 
-    if (!text) {
-      ui.setStatus("I couldn’t hear anything clear.", true);
+      ui.setStatus("Transcribing…");
+      const data = await media.transcribeAudioBlob(blob);
+      const transcript = String(data?.text || "").trim();
+
+      if (!transcript) {
+        ui.setStatus("I could not hear a clear voice transcript.", true);
+        return;
+      }
+
+      await sendTextMessage(transcript, {
+        isVoice: true,
+        wantAudio: true,
+      });
       return;
     }
 
-    refs.input.value = text;
-    await sendCurrentInput();
+    await media.startRecording();
+    setRecordingUi(true);
   } catch (err) {
-    console.error("[HOME] handleSpeakClick error:", err);
-    ui.setStatus("Voice input failed. Try again.", true);
+    console.error("[HOME] toggleVoiceInput failed:", err);
+    setRecordingUi(false);
+    ui.setStatus("Voice recording failed.", true);
   }
 }
 
-/* ---------------------------- auth / boot ----------------------------- */
-async function handleLogout() {
-  try {
-    await supabase.auth.signOut();
-  } catch (err) {
-    console.warn("[HOME] signOut warning:", err);
-  } finally {
-    window.location.href = "auth.html";
-  }
-}
+function bindEvents() {
+  refs.sendBtn?.addEventListener("click", () => sendTextMessage(refs.input?.value || ""));
+  refs.filesBtn?.addEventListener("click", handleFilesClick);
+  refs.speakBtn?.addEventListener("click", toggleVoiceInput);
 
-function bindUI() {
-  refs.sendBtn?.addEventListener("click", sendCurrentInput);
-
-  refs.input?.addEventListener("keydown", async (e) => {
+  refs.input?.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      await sendCurrentInput();
+      sendTextMessage(refs.input?.value || "");
     }
   });
 
-  refs.filesBtn?.addEventListener("click", handleFilesClick);
-  refs.speakBtn?.addEventListener("click", handleSpeakClick);
-
   refs.callBtn?.addEventListener("click", () => {
-    const url = new URL("call.html", window.location.origin);
-    if (conversationId) url.searchParams.set("c", conversationId);
-    window.location.href = url.toString();
+    window.location.href = "/call.html";
   });
 
-  refs.logoutBtn?.addEventListener("click", handleLogout);
+  refs.logoutBtn?.addEventListener("click", async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.warn("[HOME] signOut failed:", err);
+    } finally {
+      window.location.href = "/";
+    }
+  });
 
   refs.hamburger?.addEventListener("click", () => {
-    const url = new URL("history.html", window.location.origin);
-    if (conversationId) url.searchParams.set("c", conversationId);
-    window.location.href = url.toString();
+    refs.content?.classList.toggle("menu-open");
   });
 
   refs.chips.forEach((chip) => {
     chip.addEventListener("click", () => {
-      const fill = chip.getAttribute("data-fill") || chip.textContent || "";
-      if (refs.input) refs.input.value = String(fill).trim();
-      refs.input?.focus();
+      const val = chip.dataset.value || chip.textContent || "";
+      refs.input.value = String(val).trim();
+      refs.input.focus();
     });
-  });
-
-  refs.input?.addEventListener("focus", () => {
-    media.unlockAudioSystem().catch(() => {});
-  });
-
-  refs.speakBtn?.addEventListener("dblclick", () => {
-    voiceRepliesEnabled = !voiceRepliesEnabled;
-    contextState.lastMode = voiceRepliesEnabled ? "voice" : "chat";
-    ui.refreshContextUI();
-    ui.setStatus(
-      voiceRepliesEnabled ? "Voice replies enabled." : "Voice replies disabled."
-    );
   });
 }
 
 async function boot() {
   try {
-    ui.ensureContextStrip();
-    ui.ensureArtifactRail();
-    ui.refreshContextUI();
-
     await ensureAuthedOrRedirect();
     session = await getSession();
-
     if (!session?.user) {
-      window.location.href = "auth.html";
+      window.location.href = "/";
       return;
     }
 
-    getDeviceId();
-    conversationId = getConversationIdFromUrl();
+    voiceRepliesEnabled = localStorage.getItem("sow_voice_replies") === "1";
+    ui.refreshContextUI();
 
-    bindUI();
+    conversationId = getConversationIdFromUrl();
+    bindEvents();
 
     if (conversationId) {
       await loadConversationHistory(conversationId);
     } else {
-      ui.setStatus("Signed in. How can I help?");
+      ui.setStatus("Ready.");
     }
-
-    await hydrateConversationMeta();
-    ui.refreshContextUI();
   } catch (err) {
-    console.error("[HOME] boot error:", err);
-    ui.setStatus("Could not load the page.", true);
+    console.error("[HOME] boot failed:", err);
+    ui.setStatus("Could not load home.", true);
   }
 }
 

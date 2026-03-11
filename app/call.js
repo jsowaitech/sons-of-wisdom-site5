@@ -18,6 +18,10 @@ const TRANSCRIBE_ENDPOINT = "/.netlify/functions/openai-transcribe";
 const CALL_GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
 const HUME_TOKEN_ENDPOINT = "/api/hume-token";
 
+const CALL_UI_VERSION = "call-ui-reliability-v3";
+window.SOW_CALL_UI_VERSION = CALL_UI_VERSION;
+console.log("[CALL] version:", CALL_UI_VERSION);
+
 /* ---------- FEATURES ---------- */
 const HUME_ENABLED = true;
 
@@ -205,7 +209,7 @@ function renderStatus() {
     return;
   }
   if (callPhase === "joined") {
-    setStatus("Blake has joined the call…");
+    setStatus("Blake joined the call…");
     return;
   }
   if (callPhase === "greeting") {
@@ -225,7 +229,7 @@ function renderStatus() {
   }
 
   if (isThinking) {
-    setStatus("Thinking…");
+    setStatus("Blake is thinking…");
     return;
   }
 
@@ -434,6 +438,7 @@ document.addEventListener("visibilitychange", async () => {
     try {
       ttsPlayer?.pause();
     } catch {}
+
     try {
       if (isRecording) await stopRecordingTurn({ discard: true });
     } catch {}
@@ -1103,7 +1108,7 @@ async function playGreetingOnce() {
       body: JSON.stringify({
         call_id: callId,
         device_id: deviceId,
-        conversationId: conversationId || null,
+        conversation_id: conversationId || null,
       }),
     });
 
@@ -1126,8 +1131,14 @@ async function playGreetingOnce() {
       if (!speakerMuted) {
         await drainTTSQueue();
       }
-    } else if (replyText) {
-      setTransientStatus("Greeting text arrived, but no audio came back.", 2200);
+    } else {
+      const detail = data?.audio_error || "greeting audio missing";
+      warn("greeting audio missing", { detail, response: data });
+      if (replyText) {
+        setTransientStatus("Greeting text arrived, but no audio came back.", 2200);
+      } else {
+        setTransientStatus("Couldn’t load greeting audio.", 2200);
+      }
     }
 
     renderStatus();
@@ -1161,7 +1172,7 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
       signal: coachAbort.signal,
       body: JSON.stringify({
         source: "voice",
-        conversationId: conversationId || null,
+        conversation_id: conversationId || null,
         call_id: callId,
         device_id: deviceId,
         transcript: text,
@@ -1177,9 +1188,18 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
     if (!isCalling) return false;
     if (seq !== coachSeq) return false;
 
-    if (data?.debug_audio) {
-      lastDebugAudio = data.debug_audio;
-      log("debug_audio", data.debug_audio);
+    if (data?.debug?.version) {
+      console.log("[CALL] backend version:", data.debug.version);
+    }
+
+    const debugAudio =
+      data?.debug?.audio ||
+      data?.debug_audio ||
+      null;
+
+    if (debugAudio) {
+      lastDebugAudio = debugAudio;
+      log("debug_audio", debugAudio);
     }
 
     const replyText = (data?.assistant_text || data?.text || "").trim();
@@ -1190,14 +1210,15 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
 
     if (b64) {
       await enqueueTTS(b64, mime);
-    } else if (data?.audio_expected) {
+    } else {
       const detail =
         data?.audio_error ||
-        data?.debug_audio?.tts_error ||
+        debugAudio?.tts_error ||
         "audio missing";
       warn("audio missing", {
         detail,
-        debug_audio: data?.debug_audio || null,
+        debug_audio: debugAudio,
+        response: data,
       });
       setTransientStatus("Reply arrived, but audio did not play.", 2200);
     }

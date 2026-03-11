@@ -5,18 +5,12 @@
 // - Rolling summary per conversation
 // - Optional ElevenLabs TTS for voice mode
 //
-// NEW (CONVERSATION UX FIXES):
+// FRONT-DOOR LOCK:
 // - Friendly greeting for simple greetings/tests
 // - Direct response to call-intent phrases
 // - Empathy-first diagnostic flow
 // - One reflective question at a time
 // - Strong anti-repeat-question prompt guard
-//
-// NEW (STABILITY / CLEANUP):
-// - no-store responses
-// - timeout wrappers for OpenAI / Supabase / ElevenLabs
-// - title update from first real user message
-// - compact helper routing for deterministic greeting/call-intent cases
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 
@@ -349,11 +343,11 @@ function isCallIntent(text) {
 }
 
 function buildGreetingReply() {
-  return "Hey brother. I’m Blake. I’m here with you, and you don’t have to carry this alone. When you’re ready, tell me what’s been weighing on you.";
+  return "Hey brother. I’m Blake. Take a breath and settle in. I’m here with you, and you don’t have to carry this alone. When you’re ready, tell me what’s been weighing on you.";
 }
 
 function buildCallIntentReply() {
-  return "Yes, you can absolutely call me. I’m here to listen. Just tap the call button and we can talk through what you’re going through.";
+  return "Yes, absolutely. Tap the call button and we’ll talk it through together. I’m here with you.";
 }
 
 function makeConversationTitleFromText(text, maxLen = 80) {
@@ -793,7 +787,6 @@ exports.handler = async (event) => {
     const source = String(meta.source || "chat").toLowerCase();
     const conversationId = meta.conversationId || null;
 
-    // 1) Supabase: fetch conversation + recent messages
     let conversation = null;
     let recentMessages = [];
     if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY && conversationId) {
@@ -816,25 +809,21 @@ exports.handler = async (event) => {
 
     const rollingSummary = (conversation && conversation.summary) || "—";
 
-    const isFirstTurn = recentMessages.length === 0;
     const simpleGreeting = isSimpleGreeting(userMessage);
     const callIntent = isCallIntent(userMessage);
 
-    // 2) Deterministic routes for greeting / call intent
     let reply = "";
     let usedKnowledge = false;
 
     if (callIntent) {
       reply = buildCallIntentReply();
-    } else if (isFirstTurn && simpleGreeting) {
+    } else if (simpleGreeting) {
       reply = buildGreetingReply();
     } else {
-      // 3) Pinecone KB context
       const kbQuery = buildKBQuery(userMessage);
       const kbContext = await getKnowledgeContext(kbQuery);
       usedKnowledge = Boolean(kbContext && kbContext.trim());
 
-      // 4) Build messages
       const messages = [];
       messages.push({ role: "system", content: SYSTEM_PROMPT_BLAKE });
 
@@ -900,7 +889,6 @@ Do not repeat questions already answered in this memory.
       });
     }
 
-    // 5) Supabase logging
     let updatedSummary = rollingSummary === "—" ? null : rollingSummary;
     if (
       SUPABASE_REST &&
@@ -936,7 +924,6 @@ Do not repeat questions already answered in this memory.
       }
     }
 
-    // 6) Optional TTS for voice mode
     let audio = null;
     if (source === "voice") {
       try {
@@ -946,7 +933,6 @@ Do not repeat questions already answered in this memory.
       }
     }
 
-    // 7) Response
     const responseBody = {
       reply,
       usedKnowledge,

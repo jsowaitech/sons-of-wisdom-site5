@@ -1,5 +1,5 @@
 // netlify/functions/call-greeting.js
-// Son of Wisdom — Dynamic AI greeting (Codex-aligned + reliable)
+// Son of Wisdom — Dynamic AI greeting (front-door locked)
 // Returns JSON: { text, assistant_text, audio_base64?, mime, call_id, audio_expected, audio_missing?, audio_error? }
 
 const corsHeaders = {
@@ -61,7 +61,7 @@ function withTimeout(ms) {
   return { signal: ac.signal, clear: () => clearTimeout(t) };
 }
 
-function clampPlainText(s, maxChars = 420) {
+function clampPlainText(s, maxChars = 220) {
   const clean = String(s || "")
     .replace(/[#*_>`]/g, "")
     .replace(/\s+/g, " ")
@@ -73,9 +73,9 @@ function clampPlainText(s, maxChars = 420) {
 
 function fallbackGreeting() {
   const options = [
-    "Hey brother. I’m Blake. Take a breath and settle in. I’m here with you, so when you’re ready, tell me what’s been weighing on you.",
-    "Hey, I’m Blake. You don’t have to carry this alone. Take a breath, and when you’re ready, tell me what’s sitting heavy on your heart.",
-    "I’m here with you. I’m Blake. Take a breath and settle in, then tell me what battle you’re walking through right now.",
+    "Hey brother. I’m Blake. Take a breath and settle in. I’m here with you. When you’re ready, tell me what’s been weighing on you.",
+    "Hey. I’m Blake. Take a breath and settle in for a second. You don’t have to carry this alone. When you’re ready, tell me what’s sitting heavy on your heart.",
+    "Hey brother. I’m Blake. Settle in and take one breath. I’m here with you, and when you’re ready, you can tell me what’s going on.",
   ];
   return options[Math.floor(Math.random() * options.length)];
 }
@@ -87,15 +87,15 @@ async function openaiChat(messages, opts = {}) {
   const body = {
     model: OPENAI_MODEL,
     messages,
-    temperature: opts.temperature ?? 0.85,
-    presence_penalty: opts.presence_penalty ?? 0.55,
-    frequency_penalty: opts.frequency_penalty ?? 0.45,
-    max_tokens: opts.maxTokens ?? 120,
+    temperature: opts.temperature ?? 0.72,
+    presence_penalty: opts.presence_penalty ?? 0.35,
+    frequency_penalty: opts.frequency_penalty ?? 0.4,
+    max_tokens: opts.maxTokens ?? 90,
   };
 
   if (opts.user) body.user = opts.user;
 
-  const to = withTimeout(opts.timeoutMs ?? 20000);
+  const to = withTimeout(opts.timeoutMs ?? 18000);
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -152,7 +152,10 @@ async function elevenLabsTTS(text, opts = {}) {
       body: JSON.stringify({
         text: trimmed,
         model_id: "eleven_turbo_v2",
-        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.8,
+        },
       }),
       signal: to.signal,
     });
@@ -209,6 +212,59 @@ async function supabaseInsert(table, rows) {
   }
 }
 
+/* ---------- Greeting prompt ---------- */
+function buildGreetingSystem(styleSeed) {
+  return `
+You are AI Blake.
+
+Your only job right now is to speak the opening greeting for a live voice call.
+
+IDENTITY
+- masculine
+- fatherly
+- grounded
+- warm
+- direct
+- present
+- not generic
+- not polished like customer support
+- not a therapist
+- not preachy
+
+GOAL
+- welcome the man into the call
+- help him settle
+- make him feel accompanied
+- invite him to speak when ready
+
+STRICT RULES
+- 2 to 4 short sentences
+- under 60 words
+- plain text only
+- no markdown
+- no bullet points
+- no emojis
+- no sermon tone
+- no stacked questions
+- no "How can I help you today?"
+- no "What challenge are you facing today?"
+- no corporate empathy
+- do not sound like an assistant
+
+REQUIRED SHAPE
+- begin simply
+- say your name naturally
+- include one settling line like "take a breath" or "settle in"
+- reassure him he does not have to carry it alone
+- end with one gentle invitation to share when ready
+
+VARIATION
+- vary the exact wording a little
+- keep the same emotional shape every time
+- optional tone seed: ${styleSeed}
+`.trim();
+}
+
 /* ---------- Handler ---------- */
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
@@ -229,103 +285,48 @@ exports.handler = async (event) => {
     const userIdRaw = String(body.user_id || body.userId || "").trim();
     const deviceId = String(body.device_id || body.deviceId || "").trim();
     const callId = String(body.call_id || body.callId || "").trim() || null;
-
     const conversationId =
       String(body.conversationId || body.conversation_id || body.c || "").trim() ||
       null;
 
     const seed = randomSeed();
-
-    const styles = [
+    const styleSeeds = [
+      "steady and brotherly",
+      "calm and weighty",
+      "simple and fatherly",
       "warm and grounded",
-      "steady and fatherly",
-      "calm and strong",
-      "gentle but weighty",
-      "simple and brotherly",
     ];
-    const style = styles[Math.floor(Math.random() * styles.length)];
-
-    const system = `
-You are AI Blake, the voice coach of Son of Wisdom.
-
-You are not a generic assistant.
-You are a warm, masculine, fatherly presence.
-You speak like a man carrying calm strength, not like a bot, therapist, or customer support rep.
-
-Your job right now is ONLY to give the first spoken greeting for a live voice call.
-
-GOAL
-- Welcome the man into the call
-- Help him settle
-- Sound present, human, and grounded
-- Invite him to share when ready
-
-DO NOT
-- Ask multiple questions
-- Sound preachy
-- Sound like a sermon
-- Sound like a generic assistant
-- Say "How can I help you today?"
-- Say "What challenge are you facing today?"
-- Sound corporate, clinical, or overly polished
-
-GOOD GREETING SHAPE
-- 2 to 4 short sentences
-- Warm opening
-- Brief settling line like take a breath or settle in
-- Reassure him he does not have to carry it alone
-- End with one gentle invitation to share when ready
-
-TONE
-${style}
-
-STYLE RULES
-- Plain text only
-- No markdown
-- No bullet points
-- No emojis
-- Natural spoken English
-- Keep it under 65 words
-- Vary the opening so it does not repeat every time
-- You may say brother sometimes, but not always
-`.trim();
-
-    const user = `
-Generate the call opening greeting now.
-
-Seed: ${seed}
-User id: ${userIdRaw || "unknown"}
-Device id: ${deviceId || "unknown"}
-Conversation id: ${conversationId || "none"}
-`.trim();
+    const styleSeed =
+      styleSeeds[Math.floor(Math.random() * styleSeeds.length)];
 
     let text = "";
 
     try {
       const rawText = await openaiChat(
         [
-          { role: "system", content: system },
-          { role: "user", content: user },
+          { role: "system", content: buildGreetingSystem(styleSeed) },
+          {
+            role: "user",
+            content: `Generate the greeting now. Seed: ${seed}`,
+          },
         ],
         {
-          temperature: 0.9,
-          maxTokens: 100,
+          temperature: 0.78,
+          maxTokens: 90,
           timeoutMs: 18000,
           user: deviceId || userIdRaw || "sow",
-          presence_penalty: 0.6,
-          frequency_penalty: 0.6,
+          presence_penalty: 0.3,
+          frequency_penalty: 0.45,
         }
       );
 
-      text = clampPlainText(rawText, 360);
+      text = clampPlainText(rawText, 220);
     } catch (e) {
       console.warn("[call-greeting] OpenAI greeting failed, using fallback:", e);
       text = fallbackGreeting();
     }
 
-    if (!text) {
-      text = fallbackGreeting();
-    }
+    if (!text) text = fallbackGreeting();
 
     const audio_expected = true;
     const ttsRes = await elevenLabsTTS(text, { timeoutMs: 22000 });

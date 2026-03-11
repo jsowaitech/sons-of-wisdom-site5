@@ -1,6 +1,5 @@
 // app/home-api.js
 // Son of Wisdom — Home API/data helpers
-// Owns backend calls, Supabase data fetches, and dev direct OpenAI fallback
 
 export function createHomeApi(config = {}) {
   const {
@@ -72,6 +71,7 @@ export function createHomeApi(config = {}) {
 
   async function coachRequest({
     text,
+    hiddenPrompt = null,
     source = "chat",
     wantAudio = false,
     extra = {},
@@ -79,27 +79,39 @@ export function createHomeApi(config = {}) {
     userId = "",
     deviceId = "",
   }) {
+    const visibleText = String(text || "").trim();
+    const modelText = String(hiddenPrompt || text || "").trim();
+
+    if (!visibleText) throw new Error("Missing visible text");
+    if (!modelText) throw new Error("Missing model text");
+
     if (devDirectOpenAI) {
-      const reply = await chatDirectOpenAI(text, extra);
+      const reply = await chatDirectOpenAI(modelText, extra);
       return {
         assistant_text: reply,
         audio_base64: null,
         mime: null,
         usedKnowledge: false,
         usedFileContext: false,
-        conversationId: conversationId || null,
+        title: null,
+        debug: { mode: "dev-direct-openai" },
       };
     }
 
     const payload = {
+      transcript: modelText,
+      utterance: modelText,
+      user_turn: modelText,
+
+      display_text: visibleText,
+      user_visible_text: visibleText,
+
       source,
-      conversationId: conversationId || null,
-      transcript: text,
-      utterance: text,
-      user_turn: text,
-      user_id: userId || "",
-      device_id: deviceId || "",
+      conversation_id: conversationId,
+      user_id: userId,
+      device_id: deviceId,
       want_audio: !!wantAudio,
+
       ...extra,
     };
 
@@ -110,53 +122,51 @@ export function createHomeApi(config = {}) {
     });
 
     if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      throw new Error(`Coach ${res.status}: ${t || res.statusText}`);
+      const text = await res.text().catch(() => "");
+      throw new Error(`Coach request failed (${res.status}): ${text || res.statusText}`);
     }
 
-    const data = await res.json().catch(() => ({}));
-
-    return {
-      assistant_text: data.assistant_text ?? data.text ?? data.reply ?? "",
-      audio_base64: data.audio_base64 ?? null,
-      mime: data.mime ?? data.audio_mime ?? "audio/mpeg",
-      usedKnowledge: !!data.usedKnowledge,
-      usedFileContext: !!data.usedFileContext,
-      conversationId: data.conversationId ?? conversationId ?? null,
-      audio_missing: !!data.audio_missing,
-      audio_error: data.audio_error ?? null,
-    };
+    return await res.json();
   }
 
-  async function chatDirectOpenAI(text, meta = {}) {
-    const key = String(devOpenAIKey || "").trim();
-    if (!key) {
-      throw new Error(
-        "Missing OpenAI key. For dev-only browser calls, set window.OPENAI_DEV_KEY in app/dev-local.js."
-      );
+  async function chatDirectOpenAI(text, extra = {}) {
+    if (!devOpenAIKey) throw new Error("Missing DEV_OPENAI_KEY");
+
+    const systemPrompt = String(devSystemPrompt || "").trim();
+    const messages = [];
+
+    if (systemPrompt) {
+      messages.push({ role: "system", content: systemPrompt });
     }
 
-    const systemPrompt = meta.system || devSystemPrompt || "";
+    if (extra?.context) {
+      messages.push({
+        role: "system",
+        content: `Additional context:\n${String(extra.context).trim()}`,
+      });
+    }
+
+    messages.push({
+      role: "user",
+      content: String(text || "").trim(),
+    });
 
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${devOpenAIKey}`,
         "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
       },
       body: JSON.stringify({
         model: devOpenAIModel,
         temperature: 0.7,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: String(text || "").trim() },
-        ],
+        messages,
       }),
     });
 
     if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      throw new Error(`OpenAI ${res.status}: ${t || res.statusText}`);
+      const raw = await res.text().catch(() => "");
+      throw new Error(`OpenAI ${res.status}: ${raw || res.statusText}`);
     }
 
     const data = await res.json().catch(() => ({}));
@@ -169,6 +179,5 @@ export function createHomeApi(config = {}) {
     fetchConversationMessages,
     fetchConversationDocuments,
     coachRequest,
-    chatDirectOpenAI,
   };
 }

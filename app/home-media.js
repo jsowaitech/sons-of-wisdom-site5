@@ -1,6 +1,5 @@
 // app/home-media.js
-// Son of Wisdom — Home media/helpers
-// Audio playback, mic recording, transcription, file selection/upload/extract/index
+// Son of Wisdom — media helpers for upload / extract / voice
 
 export function createHomeMedia(config = {}) {
   const {
@@ -10,96 +9,45 @@ export function createHomeMedia(config = {}) {
     processUploadUrl,
   } = config;
 
-  const IS_IOS =
-    /iPad|iPhone|iPod/i.test(navigator.userAgent || "") ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
-  let ttsPlayer = null;
+  let mediaRecorder = null;
+  let chunks = [];
+  let currentStream = null;
   let audioUnlocked = false;
 
-  let recording = false;
-  let mediaStream = null;
-  let mediaRecorder = null;
-  let mediaChunks = [];
-  let chosenMime = { mime: "audio/webm;codecs=opus", ext: "webm" };
-
-  function ensureSharedAudio() {
-    if (ttsPlayer) return ttsPlayer;
-    ttsPlayer = new Audio();
-    ttsPlayer.preload = "auto";
-    ttsPlayer.playsInline = true;
-    ttsPlayer.crossOrigin = "anonymous";
-    ttsPlayer.muted = false;
-    ttsPlayer.volume = 1;
-    return ttsPlayer;
+  function supportsMediaRecorder() {
+    return !!(navigator.mediaDevices && window.MediaRecorder);
   }
 
   async function unlockAudioSystem() {
-    try {
-      ensureSharedAudio();
+    if (audioUnlocked) return true;
 
-      if (IS_IOS && !audioUnlocked) {
-        const a = ensureSharedAudio();
-        a.src =
-          "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA" +
-          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        a.volume = 0;
-        await a.play().catch(() => {});
-        a.pause();
-        a.currentTime = 0;
-        a.volume = 1;
-        audioUnlocked = true;
-      } else {
-        audioUnlocked = true;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  function base64ToBlobUrl(b64, mime = "audio/mpeg") {
-    const raw = b64.includes(",") ? b64.split(",").pop() : b64;
-    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: mime || "audio/mpeg" });
-    const url = URL.createObjectURL(blob);
-    return { url, blob };
-  }
-
-  async function playAudioUrl(url) {
-    const a = ensureSharedAudio();
     try {
-      a.pause();
-    } catch {}
-    a.src = url;
-    a.preload = "auto";
-    try {
-      const p = a.play();
-      if (p?.catch) await p.catch(() => false);
+      const audio = new Audio();
+      audio.volume = 0;
+      await audio.play().catch(() => {});
+      audio.pause();
+      audioUnlocked = true;
       return true;
     } catch {
       return false;
     }
   }
 
-  function detectRecordingMime() {
-    const candidates = [
-      { mime: "audio/webm;codecs=opus", ext: "webm" },
-      { mime: "audio/webm", ext: "webm" },
-      { mime: "audio/mp4", ext: "m4a" },
-      { mime: "audio/ogg;codecs=opus", ext: "ogg" },
-    ];
-
-    for (const c of candidates) {
-      if (window.MediaRecorder?.isTypeSupported?.(c.mime)) return c;
-    }
-
-    return { mime: "", ext: "webm" };
+  function stopStreamTracks(stream) {
+    if (!stream) return;
+    stream.getTracks().forEach((t) => {
+      try {
+        t.stop();
+      } catch {}
+    });
   }
 
-  async function ensureMicStream() {
-    if (mediaStream) return mediaStream;
+  async function startRecording() {
+    if (!supportsMediaRecorder()) {
+      throw new Error("This browser does not support audio recording.");
+    }
 
-    mediaStream = await navigator.mediaDevices.getUserMedia({
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -107,65 +55,60 @@ export function createHomeMedia(config = {}) {
       },
     });
 
-    return mediaStream;
-  }
+    currentStream = stream;
+    chunks = [];
 
-  async function startRecording(onStateChange) {
-    if (recording) return;
-
-    await unlockAudioSystem();
-    await ensureMicStream();
-
-    chosenMime = detectRecordingMime();
-    mediaChunks = [];
+    const preferredMime =
+      MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "";
 
     mediaRecorder = new MediaRecorder(
-      mediaStream,
-      chosenMime.mime ? { mimeType: chosenMime.mime } : undefined
+      stream,
+      preferredMime ? { mimeType: preferredMime } : undefined
     );
 
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data?.size > 0) mediaChunks.push(e.data);
+      if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
     mediaRecorder.start();
-    recording = true;
-    if (typeof onStateChange === "function") onStateChange(true);
+    return true;
   }
 
-  async function stopRecording(onStateChange) {
-    if (!recording || !mediaRecorder) return null;
+  async function stopRecording() {
+    if (!mediaRecorder) return null;
 
-    return new Promise((resolve) => {
-      mediaRecorder.onstop = async () => {
-        recording = false;
-        if (typeof onStateChange === "function") onStateChange(false);
+    const recorder = mediaRecorder;
 
-        const blob = new Blob(mediaChunks, {
-          type: chosenMime.mime || "audio/webm",
-        });
-
-        mediaChunks = [];
-        resolve(blob);
+    const blob = await new Promise((resolve) => {
+      recorder.onstop = () => {
+        const mime = recorder.mimeType || "audio/webm";
+        resolve(new Blob(chunks, { type: mime }));
       };
-
-      try {
-        mediaRecorder.stop();
-      } catch {
-        recording = false;
-        if (typeof onStateChange === "function") onStateChange(false);
-        resolve(null);
-      }
+      recorder.stop();
     });
+
+    stopStreamTracks(currentStream);
+    currentStream = null;
+    mediaRecorder = null;
+    chunks = [];
+
+    return blob;
   }
 
-  async function transcribeAudio(blob) {
-    if (!blob) return "";
+  function isRecording() {
+    return !!mediaRecorder && mediaRecorder.state === "recording";
+  }
+
+  async function transcribeAudioBlob(blob) {
+    if (!blob) throw new Error("Missing audio blob");
 
     const fd = new FormData();
-    fd.append("audio", blob, `user.${chosenMime.ext || "webm"}`);
-    fd.append("model", "gpt-4o-mini-transcribe");
-    fd.append("response_format", "json");
+    fd.append("file", blob, "voice.webm");
+    fd.append("language", "en");
 
     const res = await fetch(transcribeUrl, {
       method: "POST",
@@ -173,32 +116,27 @@ export function createHomeMedia(config = {}) {
     });
 
     if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      throw new Error(`Transcribe ${res.status}: ${t || res.statusText}`);
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Transcription failed (${res.status}): ${txt || res.statusText}`);
     }
 
-    const data = await res.json().catch(() => ({}));
-    return String(data?.text || data?.transcript || "").trim();
+    return await res.json().catch(() => ({}));
   }
 
   function pickFileOnce() {
     return new Promise((resolve) => {
       const input = document.createElement("input");
       input.type = "file";
-      input.accept =
-        ".pdf,.txt,.jpg,.jpeg,.png,text/plain,application/pdf,image/jpeg,image/png";
+      input.accept = ".pdf,.txt,.jpg,.jpeg,.png,text/plain,application/pdf,image/jpeg,image/png";
       input.style.display = "none";
-      document.body.appendChild(input);
 
-      input.value = "";
-      const onChange = () => {
-        input.removeEventListener("change", onChange);
-        const f = input.files?.[0] || null;
+      input.addEventListener("change", () => {
+        const file = input.files?.[0] || null;
         input.remove();
-        resolve(f);
-      };
+        resolve(file);
+      });
 
-      input.addEventListener("change", onChange, { once: true });
+      document.body.appendChild(input);
       input.click();
     });
   }
@@ -260,13 +198,13 @@ export function createHomeMedia(config = {}) {
 
   async function processUploadIndex(meta) {
     const payload = {
-      storage_path: meta.storage_path || meta.path || meta.storagePath || "",
-      filename: meta.filename || meta.fileName || "",
-      content_type: meta.content_type || meta.mime || meta.contentType || "",
-      bytes: meta.bytes || meta.size || null,
+      bucket: meta.bucket || "uploads",
+      storage_path: meta.storage_path,
+      filename: meta.filename || "file",
+      content_type: meta.content_type || "",
+      bytes: meta.bytes || 0,
       conversation_id: meta.conversation_id || null,
       user_id: meta.user_id || null,
-      bucket: meta.bucket || "uploads",
     };
 
     const res = await fetch(processUploadUrl, {
@@ -277,102 +215,431 @@ export function createHomeMedia(config = {}) {
 
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      throw new Error(`Process-upload ${res.status}: ${t || res.statusText}`);
+      throw new Error(`Process upload ${res.status}: ${t || res.statusText}`);
     }
 
     return await res.json().catch(() => ({}));
   }
 
-  function buildFilePrompt({ fileName, text, pages }) {
-    const safeName = fileName || "file";
-    const pageNote = pages ? ` (${pages} pages)` : "";
+  function normalizeArtifactText(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
 
-    return `
-You received an uploaded document: "${safeName}"${pageNote}.
+  function classifyImageText(text, fileName = "") {
+    const s = normalizeArtifactText(text);
+    const name = normalizeArtifactText(fileName);
 
-Do these:
-1. Give a concise summary.
-2. Pull out key takeaways and action items.
-3. If it's a contract, policy, or plan, list risks and missing info.
-4. End with 3 questions to ask the user next.
+    const hasChatMarkers =
+      /\bmessage\b/.test(s) ||
+      /\bmessages\b/.test(s) ||
+      /\btext message\b/.test(s) ||
+      /\bimessage\b/.test(s) ||
+      /\bwhatsapp\b/.test(s) ||
+      /\btelegram\b/.test(s) ||
+      /\bmessenger\b/.test(s) ||
+      /\bchat\b/.test(s) ||
+      /\breplied\b/.test(s) ||
+      /\bdelivered\b/.test(s) ||
+      /\bseen\b/.test(s) ||
+      /\btyping\b/.test(s) ||
+      /\byou:\b/.test(s) ||
+      /\bthem:\b/.test(s) ||
+      /\bsaid:\b/.test(s) ||
+      /\bpm\b/.test(s) ||
+      /\bam\b/.test(s);
 
-Document text:
-${text}
-`.trim();
+    const hasTeachingMarkers =
+      /\bancient wisdom\b/.test(s) ||
+      /\bslavelord\b/.test(s) ||
+      /\bfather voice\b/.test(s) ||
+      /\bson of wisdom\b/.test(s) ||
+      /\bsolomon codex\b/.test(s) ||
+      /\bdominion\b/.test(s) ||
+      /\bkingship\b/.test(s) ||
+      /\bthrone room\b/.test(s) ||
+      /\bmegiddo\b/.test(s) ||
+      /\bheart\b/.test(s) ||
+      /\bsoul\b/.test(s);
+
+    const fileSuggestsScreenshot =
+      /\bscreenshot\b/.test(name) ||
+      /\bscreen shot\b/.test(name) ||
+      /\bchat\b/.test(name) ||
+      /\bmessage\b/.test(name) ||
+      /\bwhatsapp\b/.test(name);
+
+    const hasDenseTeachingLayout =
+      (s.match(/\b[a-z]{4,}\b/g) || []).length > 25 && hasTeachingMarkers;
+
+    if (hasChatMarkers || fileSuggestsScreenshot) return "message_screenshot";
+    if (hasTeachingMarkers || hasDenseTeachingLayout) return "teaching_graphic";
+    return "general_image";
+  }
+
+  function classifyDocumentText(text, fileName = "") {
+    const s = normalizeArtifactText(text);
+    const name = normalizeArtifactText(fileName);
+
+    const hasStructure =
+      /\bsection\b/.test(s) ||
+      /\bterms\b/.test(s) ||
+      /\bagreement\b/.test(s) ||
+      /\bpolicy\b/.test(s) ||
+      /\bclause\b/.test(s) ||
+      /\barticle\b/.test(s) ||
+      /\bliability\b/.test(s) ||
+      /\bobligation\b/.test(s) ||
+      /\btermination\b/.test(s) ||
+      /\bgoverning law\b/.test(s) ||
+      /\bprivacy\b/.test(s);
+
+    const hasTeaching =
+      /\bancient wisdom\b/.test(s) ||
+      /\bslavelord\b/.test(s) ||
+      /\bfather voice\b/.test(s) ||
+      /\bson of wisdom\b/.test(s) ||
+      /\bsolomon codex\b/.test(s) ||
+      /\bdominion\b/.test(s) ||
+      /\bkingship\b/.test(s) ||
+      /\bthrone room\b/.test(s) ||
+      /\bmegiddo\b/.test(s);
+
+    const hasCreative =
+      /\bverse\b/.test(s) ||
+      /\bchorus\b/.test(s) ||
+      /\blyrics\b/.test(s) ||
+      /\bpoem\b/.test(s) ||
+      /\bbridge\b/.test(s) ||
+      /\bintro\b/.test(s) ||
+      /\boutro\b/.test(s);
+
+    const fileSuggestsCreative =
+      /\blyrics\b/.test(name) ||
+      /\bpoem\b/.test(name) ||
+      /\bsong\b/.test(name);
+
+    const fileSuggestsStructure =
+      /\bpolicy\b/.test(name) ||
+      /\bagreement\b/.test(name) ||
+      /\bterms\b/.test(name) ||
+      /\bcontract\b/.test(name);
+
+    if (hasStructure || fileSuggestsStructure) return "structured_document";
+    if (hasTeaching) return "teaching_text";
+    if (hasCreative || fileSuggestsCreative) return "creative_text";
+    return "general_text";
+  }
+
+  function getArtifactConfidence({ text, fileName = "", isImage = false }) {
+    const s = normalizeArtifactText(text);
+    const name = normalizeArtifactText(fileName);
+
+    const wordCount = (s.match(/\b[a-z]{2,}\b/g) || []).length;
+    const charCount = s.length;
+
+    const messageSignals = [
+      /\bmessage\b/,
+      /\bmessages\b/,
+      /\bimessage\b/,
+      /\bwhatsapp\b/,
+      /\bmessenger\b/,
+      /\bchat\b/,
+      /\breplied\b/,
+      /\bseen\b/,
+      /\btyping\b/,
+      /\byou:\b/,
+      /\bthem:\b/,
+    ].filter((re) => re.test(s)).length;
+
+    const teachingSignals = [
+      /\bancient wisdom\b/,
+      /\bslavelord\b/,
+      /\bfather voice\b/,
+      /\bson of wisdom\b/,
+      /\bsolomon codex\b/,
+      /\bdominion\b/,
+      /\bkingship\b/,
+      /\bthrone room\b/,
+      /\bmegiddo\b/,
+    ].filter((re) => re.test(s)).length;
+
+    const structureSignals = [
+      /\bsection\b/,
+      /\bterms\b/,
+      /\bagreement\b/,
+      /\bpolicy\b/,
+      /\bclause\b/,
+      /\barticle\b/,
+      /\bliability\b/,
+      /\bobligation\b/,
+      /\btermination\b/,
+      /\bprivacy\b/,
+    ].filter((re) => re.test(s)).length;
+
+    const creativeSignals = [
+      /\bverse\b/,
+      /\bchorus\b/,
+      /\blyrics\b/,
+      /\bpoem\b/,
+      /\bbridge\b/,
+      /\bintro\b/,
+      /\boutro\b/,
+    ].filter((re) => re.test(s)).length;
+
+    const fileHints = [
+      /\bscreenshot\b/.test(name),
+      /\bmessage\b/.test(name),
+      /\bwhatsapp\b/.test(name),
+      /\blyrics\b/.test(name),
+      /\bpolicy\b/.test(name),
+      /\bagreement\b/.test(name),
+      /\bcontract\b/.test(name),
+    ].filter(Boolean).length;
+
+    const strongest = Math.max(
+      messageSignals,
+      teachingSignals,
+      structureSignals,
+      creativeSignals,
+      fileHints
+    );
+
+    const lowText = charCount < 80 || wordCount < 14;
+    const mediumText = charCount < 180 || wordCount < 30;
+
+    if (lowText && strongest <= 1) {
+      return { ambiguous: true, confidence: "low" };
+    }
+
+    if (mediumText && strongest <= 1) {
+      return { ambiguous: true, confidence: "medium" };
+    }
+
+    if (isImage && wordCount < 10 && strongest === 0) {
+      return { ambiguous: true, confidence: "low" };
+    }
+
+    return {
+      ambiguous: false,
+      confidence: strongest >= 3 ? "high" : "medium",
+    };
+  }
+
+  function buildArtifactClarifyChoices(isImage = false) {
+    return isImage
+      ? [
+          { label: "Message screenshot", value: "message_screenshot" },
+          { label: "Teaching graphic", value: "teaching_graphic" },
+          { label: "General image", value: "general_image" },
+        ]
+      : [
+          { label: "Structured document", value: "structured_document" },
+          { label: "Teaching text", value: "teaching_text" },
+          { label: "Creative text", value: "creative_text" },
+          { label: "General document", value: "general_text" },
+        ];
+  }
+
+  function buildArtifactUserLabel({ fileName, kind, mode }) {
+    const safeName = String(fileName || "file").trim() || "file";
+    const k = String(kind || "").toLowerCase();
+    const m = String(mode || "").toLowerCase();
+
+    const imageModes = new Set([
+      "image",
+      "message_screenshot",
+      "teaching_graphic",
+      "general_image",
+    ]);
+
+    if (imageModes.has(k) || imageModes.has(m)) {
+      return `Uploaded image: ${safeName}`;
+    }
+
+    return `Uploaded file: ${safeName}`;
   }
 
   function buildImageCoachingPrompt({ fileName, text }) {
-  const safeName = fileName || "image";
+    const mode = classifyImageText(text, fileName);
+    const safeName = String(fileName || "image").trim() || "image";
+    const visibleExtract = String(text || "").trim();
 
-  return `
-The user uploaded an image or screenshot named "${safeName}".
+    if (mode === "message_screenshot") {
+      return `
+ARTIFACT MODE: message_screenshot
 
-Below is the extracted visible content from that image.
-
-You are AI Blake.
-
-Treat this as real-life relational coaching context, not like a document summary.
-
-If this appears to be:
-- a hard text exchange
-- a spouse message
-- a conflict screenshot
-- an emotionally loaded conversation
-then respond like Blake would respond to a man showing him something that landed hard in his heart.
+The user uploaded an image file named "${safeName}".
+This appears to be a screenshot of a message or chat exchange.
 
 Your job:
-- Briefly acknowledge the emotional weight or relational tension that appears to be present
-- Do not overclaim certainty about motive, tone, or intent
-- Do not summarize like a report
-- Do not sound like customer support
-- Do not sound like a document analyst
-- If something is clearly visible, reference it naturally
-- Help the user locate what happened in him when he saw or read it
-- Ask only ONE grounded follow-up question
-- Sound warm, fatherly, direct, and human
-- Stay concise
-
-Better tone:
-- I can see why that would land heavy.
-- There is weight in that exchange.
-- I can see how that could stir something in you.
-- That message carries tension.
-
-Avoid tone like:
-- Here is a summary of the uploaded content
-- The screenshot appears to contain
-- The document indicates
-- This image shows
+- respond like Blake
+- help the user discern what is happening relationally
+- focus on emotional subtext, power, truth, confusion, avoidance, pressure, or manipulation when present
+- do not reduce this to a plain summary
+- do not sound like an OCR tool
+- do not say "key takeaways"
+- give relational clarity, not generic communication advice
+- if appropriate, name the lie, the hijack, or the pressure in the exchange
 
 Visible extracted content:
-${text}
-`.trim();
-}
+${visibleExtract}
 
-  function getRecordingState() {
-    return recording;
+Respond briefly, clearly, and with weight.
+`.trim();
+    }
+
+    if (mode === "teaching_graphic") {
+      return `
+ARTIFACT MODE: teaching_graphic
+
+The user uploaded an image file named "${safeName}".
+This appears to be a teaching graphic, slide, or formation image.
+
+Your job:
+- respond like Blake
+- reflect on the spiritual meaning, weight, and implications of what is shown
+- do not flatten this into a generic summary
+- do not sound like a document assistant
+- connect to Son of Wisdom / Solomon Codex language where it fits naturally
+
+Visible extracted content:
+${visibleExtract}
+
+Respond briefly but with living weight.
+`.trim();
+    }
+
+    return `
+ARTIFACT MODE: general_image
+
+The user uploaded an image file named "${safeName}".
+
+Your job:
+- respond like Blake
+- interpret what matters in the image
+- be practical, direct, and clear
+- do not sound robotic
+- do not default to summary-bot language
+
+Visible extracted content:
+${visibleExtract}
+
+Respond in a short, useful way.
+`.trim();
   }
 
-  function getChosenMime() {
-    return chosenMime;
+  function buildFilePrompt({ fileName, text, pages = null }) {
+    const mode = classifyDocumentText(text, fileName);
+    const safeName = String(fileName || "document").trim() || "document";
+    const visibleExtract = String(text || "").trim();
+    const pageHint = pages ? `Page count: ${pages}\n` : "";
+
+    if (mode === "structured_document") {
+      return `
+ARTIFACT MODE: structured_document
+
+The user uploaded a document named "${safeName}".
+
+This appears to be a structured, formal, legal, policy, or practical document.
+
+Your job:
+- explain what matters in plain language
+- highlight obligations, risks, decisions, restrictions, deadlines, or consequences
+- be practical and clear
+- do not turn this into spiritual commentary unless the content itself calls for it
+- do not sound robotic
+
+${pageHint}Document text:
+${visibleExtract}
+
+Respond briefly and clearly.
+`.trim();
+    }
+
+    if (mode === "teaching_text") {
+      return `
+ARTIFACT MODE: teaching_text
+
+The user uploaded a document named "${safeName}".
+
+This appears to be teaching or formation material.
+
+Your job:
+- respond like Blake
+- engage the substance, not just summarize it
+- reflect weight, clarity, discernment, and spiritual implications
+- use Son of Wisdom / Solomon Codex language where appropriate
+- avoid summary-bot tone
+- do not say "key takeaways include"
+
+${pageHint}Document text:
+${visibleExtract}
+
+Respond with brief but meaningful commentary.
+`.trim();
+    }
+
+    if (mode === "creative_text") {
+      return `
+ARTIFACT MODE: creative_text
+
+The user uploaded a document named "${safeName}".
+
+This appears to be lyrics, poetry, or creative writing.
+
+Your job:
+- respond like Blake
+- reflect on meaning, tone, imagery, and spiritual or emotional weight
+- do not flatten this into a dry summary
+- do not sound like a study assistant
+
+${pageHint}Document text:
+${visibleExtract}
+
+Respond briefly but with depth.
+`.trim();
+    }
+
+    return `
+ARTIFACT MODE: general_text
+
+The user uploaded a document named "${safeName}".
+
+Your job:
+- read the content and respond helpfully
+- be concise, human, and clear
+- do not sound robotic
+- do not default to summary-bot phrasing
+
+${pageHint}Document text:
+${visibleExtract}
+
+Respond in a short useful way.
+`.trim();
   }
 
   return {
+    supportsMediaRecorder,
     unlockAudioSystem,
-    base64ToBlobUrl,
-    playAudioUrl,
     startRecording,
     stopRecording,
-    transcribeAudio,
+    isRecording,
+    transcribeAudioBlob,
     pickFileOnce,
+    isImageFile,
+    isPdfOrTextFile,
     uploadFileToStorage,
     extractFileText,
     processUploadIndex,
-    buildFilePrompt,
+    classifyImageText,
+    classifyDocumentText,
+    getArtifactConfidence,
+    buildArtifactClarifyChoices,
+    buildArtifactUserLabel,
     buildImageCoachingPrompt,
-    getRecordingState,
-    getChosenMime,
-    isImageFile,
-    isPdfOrTextFile,
+    buildFilePrompt,
   };
 }
